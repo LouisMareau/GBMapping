@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GBMapping</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>GBMapping</h1>
+  <div id="rom-info">Drop a ROM anywhere (or <label class="link">choose one<input id="rom-file" type="file" accept=".gba,.gbc,.gb,.json" multiple></label>); a profile .json can come with it.</div>
+  <div class="toolbar">
+    <label>Tool
+      <select id="tool">
+        <option value="paint">Paint (left click), pick (right click)</option>
+        <option value="collision">Collision: toggle passable</option>
+        <option value="elevation">Elevation: set</option>
+      </select>
+    </label>
+    <label id="elevation-label">Elevation <input id="elevation" type="number" min="0" max="15" value="3"></label>
+    <label>Zoom <input id="zoom" type="range" min="1" max="4" value="2"></label>
+    <label><input id="show-grid" type="checkbox"> Grid</label>
+    <label><input id="show-collision" type="checkbox"> Collision</label>
+    <label><input id="show-elevation" type="checkbox"> Elevation</label>
+    <button id="undo" title="Ctrl+Z">Undo</button>
+    <button id="redo" title="Ctrl+Y">Redo</button>
+    <button id="save-rom" class="primary" title="The ROM with your edits">Save ROM</button>
+    <button id="export-edits" title="Your edits alone, to share or to apply to another build">Export edits</button>
+    <label class="link">Import edits<input id="import-edits" type="file" accept=".json"></label>
+  </div>
+</header>
+<main>
+  <aside id="maps">
+    <input id="search" type="search" placeholder="Search maps…">
+    <ul id="map-list"></ul>
+  </aside>
+  <section id="map-area">
+    <div id="map-scroll">
+      <canvas id="map"></canvas>
+    </div>
+    <div id="status">—</div>
+  </section>
+  <aside id="side">
+    <div class="tabs"><button class="tab active" data-tab="picker">Metatiles</button><button class="tab" data-tab="tileset">Tileset</button></div>
+    <div id="tab-picker" class="tab-page">
+      <div id="picker-info">Click a metatile, or drag a rectangle to stamp several</div>
+      <div id="picker-scroll"><canvas id="picker-canvas"></canvas></div>
+      <div id="border-box">Border: <canvas id="border-canvas" width="32" height="32"></canvas> <small>(painted like the map)</small></div>
+    </div>
+    <div id="tab-tileset" class="tab-page hidden">
+      <div id="metatile-editor">
+        <div class="row"><strong id="mt-title">Metatile</strong></div>
+        <div class="row">
+          <canvas id="mt-preview" width="64" height="64"></canvas>
+          <div class="layers">
+            <div>Bottom <canvas class="mt-layer" id="mt-bottom" width="64" height="64"></canvas></div>
+            <div>Top <canvas class="mt-layer" id="mt-top" width="64" height="64"></canvas></div>
+          </div>
+        </div>
+        <div class="row small" id="mt-entry">Pick a quadrant of a layer, then a tile below</div>
+        <div class="row">
+          <label>Tile <input id="mt-tile" type="number" min="0" max="1023" value="0"></label>
+          <label><input id="mt-hflip" type="checkbox"> H flip</label>
+          <label><input id="mt-vflip" type="checkbox"> V flip</label>
+          <label>Palette <input id="mt-pal" type="number" min="0" max="15" value="0"></label>
+        </div>
+        <div class="row">
+          <label>Behavior <input id="mt-behavior" type="number" min="0" max="255" value="0"></label>
+          <label>Layer type <select id="mt-layer"><option value="0">0 normal</option><option value="1">1 covered</option><option value="2">2 split</option><option value="3">3</option></select></label>
+        </div>
+        <div class="row small">Tiles (drawn with the entry's palette):</div>
+        <div id="tiles-scroll"><canvas id="tiles-canvas"></canvas></div>
+      </div>
+    </div>
+  </aside>
+</main>
+<footer>
+  Edits go straight into the ROM in memory: <b>Save ROM</b> downloads it. <b>Export edits</b> gives a small .json of what changed
+  (maps by group.number, tilesets by address), which <b>Import edits</b> applies to a ROM again; the same file is kept in this browser per ROM.
+</footer>
+<script type="module" src="src/app.js"></script>
+</body>
+</html>
