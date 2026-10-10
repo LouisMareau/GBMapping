@@ -142,11 +142,10 @@ reload, the app installable. Screenshots land in `target/browser-check/`.
 ### Publishing
 
 `.github/workflows/site.yml` tests, builds and publishes the site to GitHub
-Pages on every push to `main` (the repository's Pages source must be
-"GitHub Actions").
+Pages on every push to `main` (the repository's Pages source is "GitHub
+Actions").
 
-The first GBMapping, in plain JavaScript, is still at the root of the
-repository (`index.html`, `style.css`, `src/`, `test/`, `package.json`): it's
-what the site serves until the Rust one is published, and can go after that.
-Both read and write the same edits files, and the same edits kept in the
-browser.
+GBMapping was first written in plain JavaScript; that version is in the
+repository's history (commit `64acd01` is the last to hold it). The Rust
+editor reads and writes the same edits files, and offers again the edits the
+first version kept in the browser.

@@ -72,18 +72,18 @@ const browser = await Browser.launch({ width: WIDTH, height: HEIGHT, profiles: j
 let step = 0;
 const shot = async (name) => { await browser.wait(300); await browser.screenshot(join(out, `${String(++step).padStart(2, '0')}-${name}.png`)); };
 
+/// What the editor has downloaded. A new Chrome profile also drops files of its own in
+/// the folder while it sets itself up (and holds them open): those are left alone.
+const downloaded = () => readdirSync(downloads).filter((name) => /\.(gba|json)$/i.test(name));
+
 /// Clicks a button that downloads a file, and returns the file's bytes
 const download = async (button) => {
-  for (const name of readdirSync(downloads)) rmSync(join(downloads, name));
+  for (const name of downloaded()) rmSync(join(downloads, name));
   await browser.click(...button);
   for (let i = 0; i < 100; i++) {
     await browser.wait(100);
-    const done = readdirSync(downloads).filter((name) => !name.endsWith('.crdownload'));
-    if (done.length) {
-      // Chrome takes a download for a navigation: what the page fetches just then is cancelled
-      await browser.wait(500);
-      return readFileSync(join(downloads, done[0]));
-    }
+    const done = downloaded();
+    if (done.length) return readFileSync(join(downloads, done[0]));
   }
   return null;
 };
