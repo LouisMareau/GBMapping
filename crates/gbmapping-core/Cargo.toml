@@ -1,0 +1,13 @@
+[package]
+name = "gbmapping-core"
+description = "Reads and edits the maps and tilesets of Game Boy Advance ROMs (no UI, no I/O)"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+png = "0.18"

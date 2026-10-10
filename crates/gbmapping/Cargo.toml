@@ -1,0 +1,38 @@
+[package]
+name = "gbmapping"
+description = "A map and tileset editor for Game Boy Advance ROMs, in the browser and on the desktop"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+gbmapping-core = { path = "../gbmapping-core" }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "persistence", "wayland", "x11"] }
+egui = "0.36"
+log = "0.4"
+serde.workspace = true
+
+# The desktop: the system's file dialogs
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rfd = "0.17"
+
+# The browser: a file input to open, a download to save
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Blob",
+    "BlobPropertyBag",
+    "Document",
+    "Element",
+    "Event",
+    "File",
+    "FileList",
+    "HtmlAnchorElement",
+    "HtmlCanvasElement",
+    "HtmlElement",
+    "HtmlInputElement",
+    "Url",
+    "Window",
+] }

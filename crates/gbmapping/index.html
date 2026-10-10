@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>GBMapping</title>
+  <meta name="description" content="A map and tileset editor for Game Boy Advance ROMs, in the browser: nothing leaves your computer.">
+  <meta name="theme-color" content="#1b1b1b">
+  <base data-trunk-public-url />
+
+  <link data-trunk rel="rust" data-bin="gbmapping" data-wasm-opt="2" />
+  <link data-trunk rel="copy-file" href="assets/manifest.json" />
+  <link data-trunk rel="copy-file" href="assets/sw.js" />
+  <link data-trunk rel="copy-file" href="assets/icon-192.png" />
+  <link data-trunk rel="copy-file" href="assets/icon-512.png" />
+  <link data-trunk rel="copy-file" href="assets/icon-maskable-512.png" />
+
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" type="image/png" href="icon-192.png">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #111; color: #ddd; font: 16px system-ui, sans-serif; }
+    /* no pull-to-refresh, no pinch on the page: the editor zooms its own map */
+    html { touch-action: manipulation; overscroll-behavior: none; }
+    canvas { display: block; width: 100%; height: 100%; outline: none; }
+    #loading { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; text-align: center; padding: 24px; }
+    #loading .ring { width: 28px; height: 28px; border: 3px solid #333; border-top-color: #4caf50; border-radius: 50%; animation: turn 0.9s linear infinite; }
+    @keyframes turn { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <canvas id="gbmapping"></canvas>
+  <div id="loading"><div class="ring"></div><p>Loading GBMapping…</p></div>
+  <noscript><p style="position:absolute;inset:0;padding:24px">GBMapping is a WebAssembly app: it needs JavaScript.</p></noscript>
+  <script>
+    // The editor is up once it has removed the loading text
+    const started = new Promise((resolve) => {
+      const observer = new MutationObserver(() => look());
+      const look = () => {
+        if (document.getElementById('loading')) return;
+        observer.disconnect();
+        resolve();
+      };
+      observer.observe(document.body, { childList: true });
+      look();
+    });
+
+    // Files (File objects) given to the editor from the page: they're dropped on it,
+    // like files dragged there
+    window.gbmappingOpen = async (files) => {
+      await started;
+      const transfer = new DataTransfer();
+      files.forEach((file) => transfer.items.add(file));
+      document.getElementById('gbmapping').dispatchEvent(new DragEvent('drop', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+    };
+
+    // Installed as an app, GBMapping can be the program .gba files open with: the
+    // system hands the files over at launch
+    if ('launchQueue' in window) {
+      window.launchQueue.setConsumer(async (launch) => {
+        if (!launch.files || !launch.files.length) return;
+        window.gbmappingOpen(await Promise.all(launch.files.map((handle) => handle.getFile())));
+      });
+    }
+
+    // Offline: the service worker keeps the files this page is made of
+    if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+      window.addEventListener('load', async () => {
+        try {
+          await navigator.serviceWorker.register('sw.js');
+          const registration = await navigator.serviceWorker.ready;
+          await started;
+          const mine = performance.getEntriesByType('resource').map((entry) => entry.name).filter((url) => url.startsWith(location.origin));
+          registration.active.postMessage({ keep: [location.href.split(/[?#]/)[0], ...new Set(mine)] });
+        } catch (error) {
+          console.warn('GBMapping works, but not offline:', error);
+        }
+      });
+    }
+  </script>
+</body>
+</html>

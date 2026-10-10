@@ -3,3 +3,5 @@
 *.gb
 *.ppm
 node_modules/
+target/
+dist/

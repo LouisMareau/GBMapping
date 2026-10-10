@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/gbmapping-core", "crates/gbmapping"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+repository = "https://github.com/LouisMareau/GBMapping"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Small and fast enough for the browser
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+
+# The dependencies optimized in debug builds too: the UI stays smooth while developing
+[profile.dev.package."*"]
+opt-level = 2

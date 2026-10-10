@@ -1,0 +1,10 @@
+# trunk serve            the editor at http://127.0.0.1:8080, rebuilt on every change
+# trunk build --release  the site in dist/, ready for any static host
+[build]
+target = "crates/gbmapping/index.html"
+dist = "dist"
+# relative addresses: the site works under any path (GitHub Pages serves it under /GBMapping/)
+public_url = "./"
+
+[watch]
+watch = ["crates"]

@@ -1,69 +1,152 @@
 # GBMapping
 
-A map and tileset editor for Game Boy Advance (and, later, Game Boy Color)
-ROMs, in the browser: drop a ROM in, paint its maps with metatiles, set
-collision and elevation, edit the metatiles themselves (tiles, flips,
-palettes, behavior), save the ROM or just your edits. Nothing leaves your
-browser.
+A map and tileset editor for Game Boy Advance ROMs, written in Rust. It runs in
+the browser (WebAssembly, installable as an app) and on the desktop, from the
+same code: open a ROM, paint its maps with its own tilesets, set collision and
+elevation, edit the metatiles, save the ROM or just your edits.
 
-**Try it:** https://louismareau.github.io/GBMapping/ (or open
-`index.html` from a local web server: `python -m http.server`).
+The ROM never leaves your computer: it's read and edited in the page.
+
+**Try it:** https://louismareau.github.io/GBMapping/
 
 ## Games
 
-| Game | Code | Maps | Tilesets | Notes |
-| --- | --- | --- | --- | --- |
-| Pokémon Emerald (USA/Europe) | BPEE | yes | metatiles, attributes | tile graphics are LZ77-compressed in the ROM: not editable yet |
-| Hacks built from pokeemerald | BPEE | yes | yes | drop a profile .json with the ROM (see below) |
+The maps are found in the ROM itself, by the shape of its data: no table of
+addresses per game, so an original cartridge dump, a build of a decompilation
+and a hack all open the same way.
 
-More games are a profile each (`src/games/`): a profile knows where the ROM
-keeps its map table, how a map header, a layout and a tileset are laid out,
-and how to decode graphics and text. FireRed/LeafGreen and Ruby/Sapphire
-(same family, other offsets and header layouts) and the Game Boy Color games
-(Crystal's 4×4 blocks, banked pointers) are the next ones.
+| Game | Codes | State |
+| --- | --- | --- |
+| Pokémon Emerald | BPE* | checked on the English and French games, and on a build of pokeemerald with 1182 maps |
+| Pokémon Ruby, Sapphire | AXV*, AXP* | same data layout as Emerald; not yet tried on a ROM |
+| Pokémon FireRed, LeafGreen | BPR*, BPG* | their own layout (640 primary metatiles, 32-bit attributes, sized borders), written from pokefirered and checked on made-up ROMs only; not yet tried on a real one |
+
+Not there yet: tile graphics and palettes (shown, not edited), map sizes,
+events and connections, metatiles of three layers, the Game Boy Color games.
 
 ## Using it
 
-- Drop a `.gba` on the page. The game is told by the ROM header; its maps
-  are listed by group with the names of their region map sections.
-- **Metatiles** tab: click one (or drag a rectangle to stamp several), paint
-  on the map; right-click the map to pick what's there. The border (the four
-  tiles around the map) is painted the same way.
-- **Collision** and **Elevation** tools set a tile impassable or not, or its
-  elevation; the checkboxes overlay them (keys: `g` grid, `c` collision,
-  `e` elevation, Ctrl+Z/Y undo/redo).
-- **Tileset** tab: the selected metatile's two layers; click a quadrant,
-  then a tile below (or type its number), set flips, palette, behavior and
-  layer type. The map and the picker update at once.
-- **Save ROM** downloads the ROM with the edits. **Export edits** downloads a
-  small `.json` with only what changed (maps by group.number, tilesets by
-  ROM address); **Import edits** applies such a file to a ROM. The same
-  edits are kept in the browser per ROM and offered again when that ROM is
-  dropped.
+- **Open…** a `.gba`, or drop it anywhere on the window. The maps are listed
+  by group; type in the search box to find one by name, place or number.
+- **Paint** (`P`): pick a metatile in the **Metatiles** tab, or drag there to
+  take a rectangle of them, then paint. Right-click the map to pick what's
+  there; right-drag to pick a whole piece of it (a house, a pond) with its
+  collision, and stamp it elsewhere.
+- **Usual collision** (on by default): a metatile taken in the picker is
+  painted with the collision and elevation it usually has on that game's
+  maps, so a tree blocks and water sits at water level without a second pass.
+- **Fill** (`F`) replaces an area of one metatile. **Collision** (`K`): drag
+  to make tiles impassable, or passable again. **Elevation** (`L`): drag to
+  set it.
+- **Grid** (`G`), **Collision** (`C`) and **Elevation** (`E`) overlays; zoom
+  with `+` and `-`, or Ctrl + wheel; the middle button drags the map.
+- The **border** (the tiles the game repeats around the map) is next to the
+  picker: click one of its tiles to set it from the selection.
+- **Tileset** tab: the selected metatile's two layers. Click a quarter, then a
+  tile below; set flips, palette, behavior (by name) and layer type. The map
+  updates at once.
+- **Undo** / **Redo** (Ctrl+Z, Ctrl+Y) cover everything, map after map.
+- **Save ROM** gives the ROM with your edits. **Export edits** gives a small
+  `.json` with only what changed; **Import edits…** (or dropping that file)
+  applies it to a ROM, another build of the same game for instance.
+- Your edits are also kept by the browser per ROM, and offered again the next
+  time that ROM is opened.
+
+### As an app
+
+In Chrome or Edge, the address bar offers to **install** GBMapping: it then
+has its own window and icon, works offline, and can be chosen to open `.gba`
+files. A desktop program is built from the same code (see below): it takes
+files on its command line, `gbmapping game.gba profile.json`.
 
 ## Profiles
 
-A hack moves things around. A profile `.json` dropped with the ROM says
-where they are and what the maps are called:
+A ROM knows its places' names ("PETALBURG CITY" for the city, its gym and its
+houses alike), not the names its maps have in a decompilation. For the original
+games those names are built in (`PetalburgCity_Gym`). For your own project, a
+profile `.json` dropped with the ROM gives them:
 
 ```json
 {
   "game": "pokeemerald",
   "name": "My hack",
-  "gMapGroups": 7006500,
-  "gRegionMapEntries": 8585828,
-  "mapsec16": true,
-  "groups": [{"name": "gMapGroup_TownsAndRoutes", "maps": [{"name": "PetalburgCity"}, "..."]}]
+  "groups": [{"name": "gMapGroup_TownsAndRoutes", "maps": ["PetalburgCity", "SlateportCity"]}]
 }
 ```
 
-Addresses are ROM offsets (decimal or hex strings aren't both accepted:
-decimal). `mapsec16` is for headers whose region map section is 16 bits.
-Without a profile the editor uses the vanilla game's addresses and looks for
-the region map names by scanning for "LITTLEROOT TOWN", which works for most
-hacks too.
+Optional fields, for the ROM the search gets wrong: `gMapGroups` and
+`gRegionMapEntries` (ROM offsets, decimal), `mapsec16` (map headers whose
+region map section is 16 bits wide), `regionNames`.
 
-## Development
+## Edits files
 
-Plain ES modules, no build step. `node test/parse.mjs <rom> [profile.json]
-[map id] [out.ppm]` lists a ROM's maps and renders one, without a browser.
+```json
+{"format": "GBMapping/1", "game": "BPEE", "title": "POKEMON EMER",
+ "maps": {"0.9": {"width": 20, "height": 20, "blocks": [], "border": []}},
+ "tilesets": {"0x3DF704": {"metatiles": {"12": [1, 2, 3, 4, 5, 6, 7, 8]}, "attributes": {"12": 3}}}}
+```
+
+Maps go by `group.number` (a layout several maps share is told once), tilesets
+by ROM address, metatiles by their number in the tileset. A block is
+`metatile | collision << 10 | elevation << 12`.
+
+## Building
+
+Rust (stable) with the `wasm32-unknown-unknown` target, and
+[Trunk](https://trunkrs.dev) for the web build.
+
+```bash
+trunk serve
+```
+
+serves the editor on http://127.0.0.1:8080 and rebuilds on every change;
+`trunk build --release` writes the site to `dist/`, ready for any static host.
+
+```bash
+cargo run --release -p gbmapping
+```
+
+runs the desktop program.
+
+| | |
+| --- | --- |
+| `crates/gbmapping-core` | the ROM: finding the tables, reading maps and tilesets, drawing, editing, undo, edits files. No UI, no I/O. |
+| `crates/gbmapping` | the editor, with [egui](https://github.com/emilk/egui); its page, manifest and service worker for the web |
+| `tools/` | generators (behavior names, map names, icons) and the browser check |
+
+### Checks
+
+```bash
+cargo test -p gbmapping-core
+```
+
+runs the core's tests on made-up ROMs. Real ones can't be in the repository;
+name yours and they're opened, drawn and edited too:
+
+```bash
+GBMAPPING_TEST_ROMS="emerald.gba;my-hack.gba" cargo test -p gbmapping-core --test roms -- --nocapture
+```
+
+`cargo run -p gbmapping-core --example inspect -- game.gba 0.9 map.png` lists
+a ROM's maps and draws one, without the editor.
+
+```bash
+node tools/browser/check.mjs game.gba
+```
+
+checks the built site in a headless Chrome, end to end: a ROM in through the
+file chooser, tiles painted with the mouse, undo, the saved ROM and the
+exported edits compared with what they should be, the edits kept across a
+reload, the app installable. Screenshots land in `target/browser-check/`.
+
+### Publishing
+
+`.github/workflows/site.yml` tests, builds and publishes the site to GitHub
+Pages on every push to `main` (the repository's Pages source must be
+"GitHub Actions").
+
+The first GBMapping, in plain JavaScript, is still at the root of the
+repository (`index.html`, `style.css`, `src/`, `test/`, `package.json`): it's
+what the site serves until the Rust one is published, and can go after that.
+Both read and write the same edits files, and the same edits kept in the
+browser.
