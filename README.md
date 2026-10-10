@@ -52,6 +52,29 @@ events and connections, metatiles of three layers, the Game Boy Color games.
 - Your edits are also kept by the browser per ROM, and offered again the next
   time that ROM is opened.
 
+### Two views: the map, and what to work from
+
+**Reference** (`R`) opens a second, read-only view next to the map. Both
+scroll and zoom together, tile facing tile, and the tile under the pointer is
+shown in both.
+
+- By default the reference is **this ROM as it was opened**: every map before
+  your edits. Right-click it (or right-drag) to take what was there, with its
+  collision, and paint it back where it's needed.
+- Or it's **another ROM** (the source menu of the reference, "Another ROM…"):
+  the original game, or an earlier build of yours. Its maps are drawn with
+  its own tilesets. That's for maps redrawn with other tiles, a region
+  brought into a hack and converted to that hack's tilesets for instance: the
+  original on one side, the conversion to polish on the other.
+- **Follow** keeps the reference on the map that goes with the one being
+  edited: the map of the same name, else the map of the same place and size
+  (the names are those the ROM can tell). When that isn't the right one,
+  choose the map in the list next to it.
+- Picking in another ROM's reference can't give its tiles: they aren't in
+  your ROM. Each is replaced by the **closest-looking metatile** of the
+  edited map's tilesets, with the collision and elevation the original had.
+  It's a first draft to correct, not a conversion.
+
 ### As an app
 
 In Chrome or Edge, the address bar offers to **install** GBMapping: it then
@@ -76,7 +99,8 @@ profile `.json` dropped with the ROM gives them:
 
 Optional fields, for the ROM the search gets wrong: `gMapGroups` and
 `gRegionMapEntries` (ROM offsets, decimal), `mapsec16` (map headers whose
-region map section is 16 bits wide), `regionNames`.
+region map section is 16 bits wide: the headers usually tell it themselves),
+`regionNames`.
 
 ## Edits files
 
@@ -136,8 +160,9 @@ node tools/browser/check.mjs game.gba
 
 checks the built site in a headless Chrome, end to end: a ROM in through the
 file chooser, tiles painted with the mouse, undo, the saved ROM and the
-exported edits compared with what they should be, the edits kept across a
-reload, the app installable. Screenshots land in `target/browser-check/`.
+exported edits compared with what they should be, tiles taken back from the
+reference, the edits kept across a reload, the app installable and working
+offline. Screenshots land in `target/browser-check/`.
 
 ### Publishing
 

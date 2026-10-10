@@ -37,6 +37,11 @@ const metatilesTab = [WIDTH - 292 + 46, 49];
 const metatile = (id) => [WIDTH - 292 + 9 + (id % 8) * 32 + 16, 160 + Math.floor(id / 8) * 32 + 16];
 /// The map's tile (x, y) at zoom 8, the map scrolled to its top left
 const tile = (x, y) => [242 + x * 16 * ZOOM + 8 * ZOOM, 46 + y * 16 * ZOOM + 8 * ZOOM];
+/// With the reference shown, the map and the reference share the middle of the page,
+/// each under a strip of controls: their tiles (x, y), at zoom 8 too. Only the first
+/// three columns are whole in each; `across` is how far into the tile to aim.
+const besideTile = (x, y, across = 0.5) => [242 + (x + across) * 16 * ZOOM, 97 + (y + 0.5) * 16 * ZOOM];
+const referenceTile = (x, y, across = 0.5) => [682 + (x + across) * 16 * ZOOM, 97 + (y + 0.5) * 16 * ZOOM];
 /// The "Apply them" button of the kept edits' dialog, from the middle of the page
 const applyKept = [WIDTH / 2 - 174, HEIGHT / 2 + 37];
 
@@ -137,6 +142,22 @@ try {
   const saved = await download(toolbar.save);
   const changed = saved ? differing(saved, original) : -1;
   check('redone, the ROM saved differs by the painted tiles only', changed >= 1 && changed <= 6, `${changed} bytes`);
+
+  // -- the reference: the ROM as it was opened, next to the map -----------------------------------
+  await browser.key('r');
+  await browser.move(...besideTile(1, 2));
+  await shot('reference');
+  // what it shows where the tiles were painted is picked with the right button, and painted back
+  await browser.drag([referenceTile(1, 1), referenceTile(2, 1)], 'right');
+  await browser.click(...besideTile(1, 1));
+  await browser.click(...referenceTile(3, 1, 0.15), 'right');
+  await browser.click(...besideTile(3, 1, 0.15));
+  await shot('reference-restored');
+  const restored = await download(toolbar.save);
+  check('tiles picked in the reference and painted back give the original ROM', !!restored && differing(restored, original) === 0, restored ? `${differing(restored, original)} bytes differ` : 'no file');
+  await browser.key('z', { ctrl: true });
+  await browser.key('z', { ctrl: true });
+  await browser.key('r');
 
   // -- the rest of the window, for the eye -------------------------------------------------------
   await browser.key('c');

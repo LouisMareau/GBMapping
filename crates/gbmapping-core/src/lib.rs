@@ -16,7 +16,7 @@ pub mod text;
 
 pub use edits::Edits;
 pub use format::{block, Family, Format};
-pub use game::{Game, Image, Map, MapId, MapInfo, OpenError};
+pub use game::{closest_metatile, Game, Image, Map, MapId, MapInfo, OpenError};
 pub use profile::Profile;
 pub use rom::Rom;
 pub use structs::Pair;

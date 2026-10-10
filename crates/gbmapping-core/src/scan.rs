@@ -187,3 +187,17 @@ pub fn find_section_names(rom: &Rom, family: Family, known: Option<usize>) -> Op
     };
     Some(if kanto { SectionNames::kanto(table, count) } else { SectionNames::hoenn(table, count) })
 }
+
+/// Do the map headers hold a 16-bit region map section? Some hacks widen it (more than
+/// 256 places), which moves the fields after it by a byte. The byte the games leave at
+/// 0 or 1 then holds the map's type, and most maps (interiors, routes, caves) have a
+/// type above 1.
+pub fn wide_sections(rom: &Rom, groups: &MapGroups) -> bool {
+    let headers = groups.groups.iter().flat_map(|(_, headers)| headers);
+    let (mut wide, mut total) = (0usize, 0usize);
+    for &header in headers {
+        total += 1;
+        wide += (rom.u8(header + 24) > 1) as usize;
+    }
+    wide * 2 > total
+}

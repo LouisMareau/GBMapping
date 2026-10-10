@@ -8,6 +8,7 @@ mod app;
 mod doc;
 mod files;
 mod map_view;
+mod reference;
 mod side;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -27,7 +28,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let app = app::App::new(cc);
-            app.files.read_paths(&arguments);
+            app.files.read_paths(&arguments, files::Purpose::Open);
             Ok(Box::new(app))
         }),
     )

@@ -1,11 +1,12 @@
 //! An opened ROM and what's being done to it: the map on screen, the stamp in hand,
 //! the stroke under way. No drawing here.
 
+use crate::reference::Reference;
 use egui::{ColorImage, TextureHandle, TextureOptions};
 use gbmapping_core::format::block;
 use gbmapping_core::game::BlockUsage;
 use gbmapping_core::gfx::METATILE;
-use gbmapping_core::{Game, Image, Map, Pair};
+use gbmapping_core::{closest_metatile, Game, Image, Map, Pair};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
 /// Metatiles per row in the picker: the games' tilesets are laid out for 8
@@ -106,10 +107,26 @@ pub struct Stroke {
     pub collision: u8,
 }
 
+/// A tileset pair's metatiles, drawn: a texture to paint maps from, and the same
+/// picture to compare metatiles by their look
 pub struct Sheet {
     pub texture: TextureHandle,
+    pub image: Image,
     pub count: usize,
     pub rows: usize,
+}
+
+impl Sheet {
+    pub fn new(ctx: &egui::Context, game: &Game, pair: Pair) -> Self {
+        let image = game.render_sheet(pair, PICKER_COLUMNS);
+        Self { texture: texture(ctx, "metatiles", &image), count: game.metatile_count(pair), rows: image.height / METATILE, image }
+    }
+
+    /// A metatile's picture
+    pub fn picture(&self, id: u16) -> Image {
+        let id = id as usize;
+        self.image.crop((id % PICKER_COLUMNS) * METATILE, (id / PICKER_COLUMNS) * METATILE, METATILE, METATILE)
+    }
 }
 
 /// Where a metatile is in a sheet of `rows` rows, as texture coordinates
@@ -153,6 +170,19 @@ pub struct Doc {
     pub unsaved_edits: bool,
     pub scroll_picker: bool,
     pub zoom_wheel: f32,
+    /// The read-only view next to the map, when there is one
+    pub reference: Option<Reference>,
+    /// The tile under the pointer, in the map (false) or in the reference (true): each shows the other's
+    pub cursor: Option<(bool, usize, usize)>,
+    /// Where the map's view is scrolled to: the reference's keeps to it
+    pub scroll: egui::Vec2,
+    /// Something to tell in the status line
+    pub notice: Option<String>,
+    /// Where the two maps' views begin on the screen, and how tall the strip over the
+    /// edited map is: adjusted until both begin at the same height, tile facing tile
+    pub map_top: f32,
+    pub reference_top: f32,
+    pub strip: f32,
     sheets: HashMap<Pair, Sheet>,
     usage: HashMap<Pair, HashMap<u16, BlockUsage>>,
     pub tiles: Option<TilesTexture>,
@@ -191,6 +221,13 @@ impl Doc {
             unsaved_edits: false,
             scroll_picker: false,
             zoom_wheel: 0.0,
+            reference: None,
+            cursor: None,
+            scroll: egui::Vec2::ZERO,
+            notice: None,
+            map_top: 0.0,
+            reference_top: 0.0,
+            strip: 0.0,
             sheets: HashMap::new(),
             usage: HashMap::new(),
             tiles: None,
@@ -267,10 +304,41 @@ impl Doc {
 
     pub fn sheet(&mut self, ctx: &egui::Context, pair: Pair) -> &Sheet {
         let game = &self.game;
-        self.sheets.entry(pair).or_insert_with(|| {
-            let image = game.render_sheet(pair, PICKER_COLUMNS);
-            Sheet { texture: texture(ctx, "metatiles", &image), count: game.metatile_count(pair), rows: image.height / METATILE }
-        })
+        self.sheets.entry(pair).or_insert_with(|| Sheet::new(ctx, game, pair))
+    }
+
+    /// Takes a rectangle of the reference's map as the stamp. The reference being this
+    /// ROM as it was opened, its tiles come as they were. Another ROM has other tilesets:
+    /// each of its metatiles is replaced by the closest-looking one of this map's, with
+    /// the collision and elevation it has there.
+    pub fn pick_from_reference(&mut self, ctx: &egui::Context, a: (usize, usize), b: (usize, usize)) {
+        let Some(pair) = self.map.as_ref().map(|m| m.pair) else { return };
+        self.sheet(ctx, pair);
+        let Some(reference) = self.reference.as_mut() else { return };
+        let Some(from) = reference.map.as_ref() else { return };
+        let (from_pair, mut stamp) = (from.pair, Stamp::from_map(from, a, b));
+        let same_tiles = reference.own && from_pair == pair;
+        if !same_tiles {
+            reference.sheet(ctx, from_pair);
+            let (Some(theirs), Some(ours)) = (reference.drawn(from_pair), self.sheets.get(&pair)) else { return };
+            let mut matches: HashMap<u16, u16> = HashMap::new();
+            for cell in &mut stamp.cells {
+                let id = cell.metatile;
+                cell.metatile = *matches
+                    .entry(id)
+                    .or_insert_with(|| closest_metatile(&ours.image, PICKER_COLUMNS, ours.count, &theirs.picture(id)).unwrap_or(0));
+            }
+            let first = stamp.first() as usize;
+            stamp.picker = (stamp.cells.len() == 1).then_some((first % PICKER_COLUMNS, first / PICKER_COLUMNS));
+        }
+        let size = format!("{}×{}", stamp.width, stamp.height);
+        self.notice = Some(if same_tiles {
+            format!("Picked {size} from the reference: the tiles as they were")
+        } else {
+            format!("Picked {size} from the reference: the closest-looking metatiles of this map's tilesets, to be checked")
+        });
+        self.stamp = stamp;
+        self.scroll_picker = true;
     }
 
     fn usage(&mut self, pair: Pair) -> &HashMap<u16, BlockUsage> {

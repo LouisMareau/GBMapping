@@ -3,7 +3,7 @@
 
 use gbmapping_core::format::block;
 use gbmapping_core::text;
-use gbmapping_core::{Edits, Family, Game, MapId, OpenError, Profile};
+use gbmapping_core::{closest_metatile, Edits, Family, Game, Image, MapId, OpenError, Profile};
 
 const RED: u16 = 0x001F;
 const GREEN: u16 = 0x03E0;
@@ -12,6 +12,8 @@ const BLUE: u16 = 0x7C00;
 struct Builder {
     bytes: Vec<u8>,
     kanto: bool,
+    /// Map headers with a 16-bit region map section, as some hacks have
+    wide: bool,
 }
 
 impl Builder {
@@ -20,7 +22,7 @@ impl Builder {
         bytes[0xA0..0xA8].copy_from_slice(b"SYNTHROM");
         bytes[0xAC..0xAC + code.len()].copy_from_slice(code.as_bytes());
         bytes[0xB2] = 0x96;
-        Self { bytes, kanto }
+        Self { bytes, kanto, wide: false }
     }
 
     /// Where the next thing goes (word-aligned)
@@ -94,6 +96,10 @@ impl Builder {
     fn header(&mut self, layout: usize, mapsec: u8) -> usize {
         let p = |o: usize| 0x0800_0000 + o as u32;
         let scripts = self.put(&[0, 0, 0, 0]);
+        if self.wide {
+            // the section on two bytes, then cave, weather, and the map's type a byte later
+            return self.words(&[p(layout), 0, p(scripts), 0, 0x0001_012C, mapsec as u32, 8]);
+        }
         self.words(&[p(layout), 0, p(scripts), 0, 0x0001_012C, mapsec as u32 | 2 << 24, 0])
     }
 }
@@ -108,7 +114,12 @@ struct Synth {
 
 /// 3 maps in 2 groups: 0.0 (3x2), then 0.1 and 1.0 drawn from one layout (2x2)
 fn synth(code: &str, kanto: bool) -> Synth {
+    synth_with(code, kanto, false)
+}
+
+fn synth_with(code: &str, kanto: bool, wide: bool) -> Synth {
     let mut b = Builder::new(code, kanto);
+    b.wide = wide;
     let p = |o: usize| 0x0800_0000 + o as u32;
     let (primary_tiles, primary_pals) = if kanto { (640u16, 7usize) } else { (512, 6) };
 
@@ -401,4 +412,74 @@ fn the_usual_collision_and_elevation_of_a_metatile() {
     assert_eq!(usage[&2].choose(block::pack(9, 1, 1)), block::pack(0, 0, 1));
     // a metatile no map uses keeps what the tile had
     assert_eq!(gbmapping_core::game::BlockUsage::default().choose(block::pack(9, 1, 4)), block::pack(0, 1, 4));
+}
+
+#[test]
+fn headers_with_a_wide_section_are_told_by_themselves() {
+    let plain = open(&synth("BPEE", false));
+    assert!(!plain.mapsec16);
+    assert_eq!(plain.maps[0].header.map_type, 2);
+
+    let wide = open(&synth_with("BPEE", false, true));
+    assert!(wide.mapsec16, "no profile said so: the headers did");
+    assert_eq!((wide.maps[0].header.mapsec, wide.maps[0].header.map_type), (2, 8));
+    let names: Vec<&str> = wide.maps.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, ["PLACE 2", "PLACE 3", "PLACE 3"]);
+}
+
+#[test]
+fn a_map_is_found_again_in_another_game() {
+    let s = synth("BPEE", false);
+    let plain = open(&s);
+    // nothing names the maps: the place and the size tell them, and their rank among those alike
+    for index in 0..3 {
+        assert_eq!(plain.counterpart(&plain, index), Some(index));
+    }
+    // the other game names its maps, this one doesn't: still the place and the size
+    let named = |names: [&str; 3]| {
+        let json = format!(
+            r#"{{"groups": [{{"name": "A", "maps": ["{}", "{}"]}}, {{"name": "B", "maps": ["{}"]}}]}}"#,
+            names[0], names[1], names[2]
+        );
+        Game::open(s.bytes.clone(), "synth.gba", Profile::from_json(&json).unwrap()).unwrap()
+    };
+    let ours = named(["TownA", "HouseB", "HouseC"]);
+    assert_eq!(plain.counterpart(&ours, 2), Some(2));
+    // both name them: the name wins over the rank (their second map is our third)
+    let theirs = named(["Elsewhere", "housec", "Other"]);
+    assert_eq!(ours.counterpart(&theirs, 1), Some(2));
+    assert_eq!(ours.counterpart(&theirs, 0), Some(0), "an unknown name: the place and the size again");
+    // a place this game doesn't have
+    let elsewhere =
+        Game::open(s.bytes.clone(), "synth.gba", Profile::from_json(r#"{"regionNames": {"2": "ELSEWHERE"}}"#).unwrap()).unwrap();
+    assert_eq!(elsewhere.maps[0].section.as_deref(), Some("ELSEWHERE"));
+    assert_eq!(plain.counterpart(&elsewhere, 0), None);
+    assert_eq!(plain.counterpart(&elsewhere, 1), None, "a map of no known place has no counterpart");
+    assert_eq!(plain.counterpart(&plain, 9), None);
+}
+
+#[test]
+fn the_closest_looking_metatile() {
+    for (s, family) in both() {
+        let game = open(&s);
+        let pair = game.maps[0].layout.pair();
+        let (columns, count) = (8, game.metatile_count(pair));
+        let sheet = game.render_sheet(pair, columns);
+        let picture = |id: usize| sheet.crop((id % columns) * 16, (id / columns) * 16, 16, 16);
+        // a metatile's own picture
+        for id in [1usize, 2, s.first_secondary as usize] {
+            assert_eq!(closest_metatile(&sheet, columns, count, &picture(id)), Some(id as u16), "{family:?}");
+        }
+        // pictures that are no metatile's: the nearest color
+        let flat = |color: [u8; 4]| Image::filled(16, 16, color);
+        assert_eq!(closest_metatile(&sheet, columns, count, &flat([240, 30, 20, 255])), Some(1), "reddish: the red one");
+        assert_eq!(closest_metatile(&sheet, columns, count, &flat([10, 20, 230, 255])), Some(s.first_secondary), "bluish: the blue one");
+        assert_eq!(closest_metatile(&sheet, columns, count, &flat([8, 8, 8, 255])), Some(0), "dark: the first of the blank ones");
+        // ids that hold nothing are never the answer, and a sheet of nothing has none
+        assert_eq!(closest_metatile(&Image::new(128, 32), columns, 16, &flat([0, 0, 0, 255])), None);
+        // a crop past the picture's edge is see-through there
+        let corner = sheet.crop(sheet.width - 8, 0, 16, 16);
+        assert_eq!(corner.pixel(8, 0)[3], 0);
+        assert_eq!(corner.pixel(7, 0), sheet.pixel(sheet.width - 1, 0));
+    }
 }

@@ -7,7 +7,7 @@ use crate::map_view::{scale_for, snap};
 use egui::{pos2, vec2, Align, Color32, Mesh, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui, Vec2};
 use gbmapping_core::format::{block, AttrField};
 use gbmapping_core::gfx::{TileEntry, METATILE, TILE};
-use gbmapping_core::Pair;
+use gbmapping_core::{Game, Pair};
 
 const ACCENT: Color32 = Color32::from_rgb(76, 175, 80);
 const GROUND: Color32 = Color32::from_gray(17);
@@ -30,12 +30,12 @@ pub fn show(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings) {
 }
 
 /// "0x00D TALL_GRASS"
-pub fn describe(doc: &Doc, pair: Pair, id: u16) -> String {
-    if doc.game.locate(pair, id).is_none() {
+pub fn describe(game: &Game, pair: Pair, id: u16) -> String {
+    if game.locate(pair, id).is_none() {
         return format!("0x{id:03X} (nothing)");
     }
-    let behavior = doc.game.behavior(pair, id);
-    match doc.game.format.behavior_name(behavior) {
+    let behavior = game.behavior(pair, id);
+    match game.format.behavior_name(behavior) {
         Some(name) => format!("0x{id:03X} {name}"),
         None => format!("0x{id:03X} behavior 0x{behavior:02X}"),
     }
@@ -56,7 +56,7 @@ fn picker(ui: &mut Ui, doc: &mut Doc, pair: Pair) {
     } else {
         String::new()
     };
-    ui.label(egui::RichText::new(format!("{}{size}", describe(doc, pair, shown))).small());
+    ui.label(egui::RichText::new(format!("{}{size}", describe(&doc.game, pair, shown))).small());
 
     // the border: the tiles the game repeats around the map
     if let Some((bw, bh, border)) = doc.map.as_ref().map(|m| (m.border_width, m.border_height, m.border.clone())) {

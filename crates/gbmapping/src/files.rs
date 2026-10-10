@@ -7,6 +7,16 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 pub struct Incoming {
     pub name: String,
     pub bytes: Result<Vec<u8>, String>,
+    pub purpose: Purpose,
+}
+
+/// What a file was asked for
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Purpose {
+    /// To be opened: the ROM to edit, a profile, edits
+    Open,
+    /// A ROM to look at next to the one that's edited
+    Reference,
 }
 
 pub struct Files {
@@ -60,13 +70,13 @@ impl Files {
         for file in dropped {
             let name = file.path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "dropped file".to_string());
             #[cfg(not(target_arch = "wasm32"))]
-            self.tx.send(Incoming { name, bytes: file.bytes() }).ok();
+            self.tx.send(Incoming { name, bytes: file.bytes(), purpose: Purpose::Open }).ok();
             #[cfg(target_arch = "wasm32")]
             {
                 let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
                 wasm_bindgen_futures::spawn_local(async move {
                     let bytes = file.bytes_async().await;
-                    tx.send(Incoming { name, bytes }).ok();
+                    tx.send(Incoming { name, bytes, purpose: Purpose::Open }).ok();
                     ctx.request_repaint();
                 });
             }
@@ -76,18 +86,18 @@ impl Files {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl Files {
-    pub fn read_paths(&self, paths: &[std::path::PathBuf]) {
+    pub fn read_paths(&self, paths: &[std::path::PathBuf], purpose: Purpose) {
         for path in paths {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            self.tx.send(Incoming { name, bytes: std::fs::read(path).map_err(|e| e.to_string()) }).ok();
+            self.tx.send(Incoming { name, bytes: std::fs::read(path).map_err(|e| e.to_string()), purpose }).ok();
         }
         self.ctx.request_repaint();
     }
 
     /// Asks for files to open; they arrive in the queue
-    pub fn open(&self, kind: Kind) {
+    pub fn open(&self, kind: Kind, purpose: Purpose) {
         if let Some(paths) = rfd::FileDialog::new().add_filter(kind.label(), kind.extensions()).pick_files() {
-            self.read_paths(&paths);
+            self.read_paths(&paths, purpose);
         }
     }
 
@@ -104,7 +114,7 @@ impl Files {
 #[cfg(target_arch = "wasm32")]
 impl Files {
     /// Asks for files to open (the browser's file chooser); they arrive in the queue
-    pub fn open(&self, kind: Kind) {
+    pub fn open(&self, kind: Kind, purpose: Purpose) {
         use wasm_bindgen::{closure::Closure, JsCast as _};
 
         let Some(input) = web_sys::window()
@@ -127,7 +137,7 @@ impl Files {
                         .await
                         .map(|buffer| js_sys::Uint8Array::new(&buffer).to_vec())
                         .map_err(|e| format!("{e:?}"));
-                    tx.send(Incoming { name: file.name(), bytes }).ok();
+                    tx.send(Incoming { name: file.name(), bytes, purpose }).ok();
                     ctx.request_repaint();
                 });
             }

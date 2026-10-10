@@ -90,6 +90,17 @@ impl Image {
         Self { width, height, rgba: color.repeat(width * height) }
     }
 
+    /// A part of the picture (what's outside it is left transparent)
+    pub fn crop(&self, x: usize, y: usize, width: usize, height: usize) -> Self {
+        let mut out = Self::new(width, height);
+        for row in 0..height.min(self.height.saturating_sub(y)) {
+            let n = width.min(self.width.saturating_sub(x)) * 4;
+            let from = ((y + row) * self.width + x) * 4;
+            out.rgba[row * width * 4..row * width * 4 + n].copy_from_slice(&self.rgba[from..from + n]);
+        }
+        out
+    }
+
     pub fn pixel(&self, x: usize, y: usize) -> [u8; 4] {
         let o = (y * self.width + x) * 4;
         [self.rgba[o], self.rgba[o + 1], self.rgba[o + 2], self.rgba[o + 3]]
@@ -200,6 +211,8 @@ pub struct Game {
     pub family: Family,
     pub format: &'static Format,
     pub profile: Profile,
+    /// The map headers' region map section is 16 bits wide (the profile says so, or the headers do)
+    pub mapsec16: bool,
     pub groups: MapGroups,
     pub sections: Option<SectionNames>,
     pub maps: Vec<MapInfo>,
@@ -244,12 +257,14 @@ impl Game {
             return Err(OpenError::NoMaps { header: format!("{} {}", header.title, header.code).trim().to_string(), gba: rom.is_gba() });
         };
         let sections = scan::find_section_names(&rom, family, profile.region_map_entries);
+        let mapsec16 = profile.mapsec16 || scan::wide_sections(&rom, &groups);
         let mut game = Self {
             original: rom.clone(),
             rom,
             family,
             format: family.format(),
             profile,
+            mapsec16,
             groups,
             sections,
             maps: Vec::new(),
@@ -262,7 +277,7 @@ impl Game {
     }
 
     fn reader(&self) -> Reader<'_> {
-        Reader { rom: &self.rom, format: self.format, mapsec16: self.profile.mapsec16 }
+        Reader { rom: &self.rom, format: self.format, mapsec16: self.mapsec16 }
     }
 
     /// The original game's map names, when this ROM's groups are still the original's:
@@ -328,6 +343,30 @@ impl Game {
     /// The ROM as it was opened
     pub fn original(&self) -> &Rom {
         &self.original
+    }
+
+    /// The map of this game that is `other`'s map `index`: the same map in another build
+    /// of the game, or the map it was made from in another game. By name when both games
+    /// name their maps; else the map of the same place and size (the n-th of them when
+    /// several are alike, as a town's houses are).
+    pub fn counterpart(&self, other: &Game, index: usize) -> Option<usize> {
+        let wanted = other.maps.get(index)?;
+        // a map has a name of its own when it isn't just its place's
+        let named = |m: &MapInfo| m.section.as_deref() != Some(m.name.as_str());
+        if named(wanted) {
+            let mut same = (0..self.maps.len()).filter(|&i| named(&self.maps[i]) && self.maps[i].name.eq_ignore_ascii_case(&wanted.name));
+            if let (Some(i), None) = (same.next(), same.next()) {
+                return Some(i);
+            }
+        }
+        let alike = |m: &MapInfo| {
+            m.section.is_some()
+                && m.section == wanted.section
+                && (m.layout.width, m.layout.height) == (wanted.layout.width, wanted.layout.height)
+        };
+        let rank = other.maps[..index].iter().filter(|m| alike(m)).count();
+        let mine: Vec<usize> = (0..self.maps.len()).filter(|&i| alike(&self.maps[i])).collect();
+        mine.get(rank).or(mine.first()).copied()
     }
 
     pub fn map_index(&self, id: MapId) -> Option<usize> {
@@ -675,4 +714,31 @@ impl Game {
         }
         image
     }
+}
+
+/// The metatile of a sheet (see `Game::render_sheet`: `count` metatiles, `columns` to a
+/// row) that looks most like a 16x16 picture: the one whose pixels differ the least
+pub fn closest_metatile(sheet: &Image, columns: usize, count: usize, target: &Image) -> Option<u16> {
+    let mut best: Option<(u64, u16)> = None;
+    for id in 0..count {
+        let (ox, oy) = ((id % columns) * METATILE, (id / columns) * METATILE);
+        if oy + METATILE > sheet.height || ox + METATILE > sheet.width || sheet.pixel(ox, oy)[3] == 0 {
+            continue; // nothing at this id
+        }
+        let limit = best.map_or(u64::MAX, |(d, _)| d);
+        let mut distance = 0u64;
+        'pixels: for y in 0..METATILE.min(target.height) {
+            for x in 0..METATILE.min(target.width) {
+                let (a, b) = (sheet.pixel(ox + x, oy + y), target.pixel(x, y));
+                distance += (0..3).map(|c| (a[c] as i64 - b[c] as i64).pow(2) as u64).sum::<u64>();
+                if distance >= limit {
+                    break 'pixels;
+                }
+            }
+        }
+        if distance < limit {
+            best = Some((distance, id as u16));
+        }
+    }
+    best.map(|(_, id)| id)
 }

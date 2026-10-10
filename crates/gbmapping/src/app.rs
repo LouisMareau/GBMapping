@@ -2,7 +2,8 @@
 //! line. A ROM comes in by the dialog or a drop and leaves by "Save ROM".
 
 use crate::doc::{Doc, Tool};
-use crate::files::{Files, Incoming, Kind};
+use crate::files::{Files, Incoming, Kind, Purpose};
+use crate::reference::{self, Reference};
 use crate::{map_view, side};
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText, Ui};
 use gbmapping_core::format::block;
@@ -26,6 +27,8 @@ pub struct Settings {
     pub show_grid: bool,
     pub show_collision: bool,
     pub show_elevation: bool,
+    /// The read-only view next to the map
+    pub show_reference: bool,
     pub tab: Tab,
 }
 
@@ -39,6 +42,7 @@ impl Default for Settings {
             show_grid: false,
             show_collision: false,
             show_elevation: false,
+            show_reference: false,
             tab: Tab::Metatiles,
         }
     }
@@ -138,8 +142,8 @@ impl App {
             return;
         }
         // Profiles first, so that a ROM dropped with its profile opens with it; edits last
-        let (mut profiles, mut roms, mut edits) = (Vec::new(), Vec::new(), Vec::new());
-        for Incoming { name, bytes } in incoming {
+        let (mut profiles, mut roms, mut references, mut edits) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for Incoming { name, bytes, purpose } in incoming {
             let bytes = match bytes {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -152,6 +156,7 @@ impl App {
                 (true, Ok(text)) if Edits::looks_like(text) => edits.push((name, text.to_string())),
                 (true, Ok(text)) => profiles.push((name, text.to_string())),
                 (true, Err(_)) => self.fail("That file can't be read", format!("{name} isn't text.")),
+                (false, _) if purpose == Purpose::Reference => references.push((name, bytes)),
                 (false, _) => roms.push((name, bytes)),
             }
         }
@@ -173,6 +178,26 @@ impl App {
         for (name, text) in edits {
             self.import_edits(&name, &text);
         }
+        if let Some((name, bytes)) = references.pop() {
+            self.open_reference(name, bytes);
+        }
+    }
+
+    /// Another ROM to look at next to the one being edited
+    fn open_reference(&mut self, name: String, bytes: Vec<u8>) {
+        let Some(doc) = self.doc.as_mut() else {
+            self.fail("Open a ROM first", "The reference is shown next to the ROM being edited.");
+            return;
+        };
+        match Reference::other(bytes, name.clone()) {
+            Ok(reference) => {
+                let maps = reference.game.maps.len();
+                doc.reference = Some(reference);
+                self.settings.show_reference = true;
+                self.say(format!("Reference: {name}, {maps} maps"));
+            }
+            Err(e) => self.fail("That ROM can't be the reference", format!("{name}: {e}")),
+        }
     }
 
     fn open_rom(&mut self, name: String, bytes: Vec<u8>, frame: &mut eframe::Frame) {
@@ -184,7 +209,10 @@ impl App {
                     .and_then(|json| Edits::from_json(&json).ok())
                     .filter(|e| !e.is_empty());
                 self.say(format!("{name}: {} maps", game.maps.len()));
-                self.doc = Some(Doc::new(game, name));
+                let reference = self.doc.take().and_then(|d| d.reference).filter(|r| !r.own);
+                let mut doc = Doc::new(game, name);
+                doc.reference = reference;
+                self.doc = Some(doc);
                 self.search.clear();
                 self.storage_full = false;
                 self.dialog = stored.map(Dialog::StoredEdits);
@@ -209,6 +237,7 @@ impl App {
                 }
                 reopened.reload();
                 reopened.unsaved_edits = false;
+                reopened.reference = doc.reference.take().filter(|r| !r.own);
                 self.doc = Some(reopened);
                 self.say("The ROM is shown with the profile's names");
             }
@@ -309,7 +338,7 @@ impl App {
             self.undo();
         }
         if pressed(&OPEN) {
-            self.files.open(Kind::Any);
+            self.files.open(Kind::Any, Purpose::Open);
         }
         if pressed(&SAVE) {
             self.save_rom();
@@ -328,6 +357,7 @@ impl App {
         s.show_grid ^= key(Key::G);
         s.show_collision ^= key(Key::C);
         s.show_elevation ^= key(Key::E);
+        s.show_reference ^= key(Key::R);
         if key(Key::Plus) || key(Key::Equals) {
             s.zoom = (s.zoom + 1).min(map_view::MAX_ZOOM);
         }
@@ -358,7 +388,7 @@ impl App {
             ui.label(RichText::new("GBMapping").strong());
             ui.separator();
             if ui.button("Open…").on_hover_text("A ROM (.gba), a profile or an edits file (.json). Dropping them on the window works too.").clicked() {
-                self.files.open(Kind::Any);
+                self.files.open(Kind::Any, Purpose::Open);
             }
             let open = self.doc.is_some();
             let modified = self.doc.as_ref().is_some_and(|d| d.game.modified());
@@ -370,7 +400,7 @@ impl App {
                 self.export_edits();
             }
             if ui.add_enabled(open, egui::Button::new("Import edits…")).on_hover_text("Applies an edits .json to this ROM").clicked() {
-                self.files.open(Kind::Json);
+                self.files.open(Kind::Json, Purpose::Open);
             }
             if !open {
                 return;
@@ -412,6 +442,10 @@ impl App {
             ui.checkbox(&mut s.show_grid, "Grid").on_hover_text("G");
             ui.checkbox(&mut s.show_collision, "Collision").on_hover_text("C: impassable tiles in red");
             ui.checkbox(&mut s.show_elevation, "Elevation").on_hover_text("E: each tile's elevation");
+            ui.separator();
+            ui.checkbox(&mut s.show_reference, "Reference").on_hover_text(
+                "R: a second, read-only view next to the map. It shows this ROM as it was opened, or another ROM (the original game, an earlier build): the model to work from.",
+            );
         });
     }
 
@@ -502,7 +536,20 @@ impl App {
                 ui.separator();
             }
             let Some(map) = doc.map.as_ref() else { return };
+            let over_reference =
+                doc.reference.as_ref().filter(|_| self.settings.show_reference).and_then(|r| Some((r, r.map.as_ref()?, r.hover?)));
             let text = match doc.hover {
+                _ if over_reference.is_some() => {
+                    let Some((reference, shown, h)) = over_reference else { return };
+                    let passable = if block::collision(h.block) == 0 { "passable" } else { "impassable" };
+                    format!(
+                        "Reference ({}, {})  ·  metatile {}  ·  {passable}  ·  elevation {}",
+                        h.x,
+                        h.y,
+                        side::describe(&reference.game, shown.pair, block::metatile(h.block)),
+                        block::elevation(h.block)
+                    )
+                }
                 Some(h) => {
                     let id = block::metatile(h.block);
                     let passable = if block::collision(h.block) == 0 { "passable" } else { "impassable" };
@@ -510,7 +557,7 @@ impl App {
                         "({}, {})  ·  metatile {}  ·  {passable}  ·  elevation {}",
                         h.x,
                         h.y,
-                        side::describe(doc, map.pair, id),
+                        side::describe(&doc.game, map.pair, id),
                         block::elevation(h.block)
                     )
                 }
@@ -524,6 +571,34 @@ impl App {
         });
     }
 
+    /// The reference, between the map and the side panel: by default this ROM as it was opened
+    fn reference_pane(&mut self, ui: &mut Ui) {
+        let Some(doc) = self.doc.as_mut().filter(|_| self.settings.show_reference) else { return };
+        if doc.reference.is_none() {
+            doc.reference = Reference::own(&doc.game, &doc.file_name);
+        }
+        if let (Some(reference), Some(map)) = (doc.reference.as_mut(), doc.map.as_ref()) {
+            reference.follow_map(&doc.game, map.index);
+        }
+        // half of what the map has, to begin with
+        let room = ui.available_width();
+        let pane = egui::Panel::right("reference")
+            .resizable(true)
+            .default_size((room / 2.0).max(200.0))
+            .size_range(160.0..=(room - 160.0).max(160.0));
+        pane.frame(egui::Frame::new().fill(Color32::from_gray(17))).show(ui, |ui| {
+            let header = egui::Frame::new().fill(ui.visuals().panel_fill).inner_margin(egui::Margin::symmetric(8, 0));
+            let action = header.show(ui, |ui| reference::header(ui, doc, &self.files)).inner;
+            if let Some(reference::Action::Own) = action {
+                doc.reference = Reference::own(&doc.game, &doc.file_name);
+                if let (Some(reference), Some(map)) = (doc.reference.as_mut(), doc.map.as_ref()) {
+                    reference.follow_map(&doc.game, map.index);
+                }
+            }
+            map_view::show_reference(ui, doc, &mut self.settings);
+        });
+    }
+
     fn welcome(&mut self, ui: &mut Ui) {
         ui.vertical_centered(|ui| {
             ui.add_space((ui.available_height() * 0.22).max(16.0));
@@ -531,7 +606,7 @@ impl App {
             ui.label("A map and tileset editor for Game Boy Advance ROMs");
             ui.add_space(16.0);
             if ui.add(egui::Button::new(RichText::new("  Open a ROM…  ").size(18.0))).clicked() {
-                self.files.open(Kind::Any);
+                self.files.open(Kind::Any, Purpose::Open);
             }
             ui.add_space(6.0);
             ui.label("or drop a .gba anywhere on this window");
@@ -597,6 +672,26 @@ impl App {
     }
 }
 
+/// Over the map when the reference is shown: what's being edited, in a strip as tall as
+/// the reference's controls (see `Doc::strip`), so that the two maps sit tile facing tile.
+/// Painted, not laid out: nothing but the strip's height moves what's under it.
+fn map_header(ui: &mut Ui, doc: &Doc) {
+    let Some(map) = doc.map.as_ref() else { return };
+    let (strip, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), doc.strip), egui::Sense::hover());
+    let painter = ui.painter().with_clip_rect(strip);
+    painter.rect_filled(strip, 0.0, ui.visuals().panel_fill);
+    let (row, font) = (ui.spacing().interact_size.y, egui::TextStyle::Body.resolve(ui.style()));
+    let first = strip.left_top() + egui::vec2(8.0, 4.0 + row / 2.0);
+    let title = painter.text(first, egui::Align2::LEFT_CENTER, "Editing", font.clone(), ui.visuals().strong_text_color());
+    let name = format!("{}  ({})", map.name, map.id);
+    painter.text(egui::pos2(title.right() + 8.0, first.y), egui::Align2::LEFT_CENTER, name, font.clone(), ui.visuals().text_color());
+    let shared = doc.game.layout_users(map.layout.offset).len();
+    let shared = if shared > 1 { format!("  ·  layout shared by {shared} maps") } else { String::new() };
+    let second = first + egui::vec2(0.0, row + ui.spacing().item_spacing.y);
+    let details = format!("{}×{} tiles{shared}", map.width, map.height);
+    painter.text(second, egui::Align2::LEFT_CENTER, details, font, ui.visuals().weak_text_color());
+}
+
 /// Where a ROM's edits are kept: by game code, title and size (the key the first,
 /// JavaScript GBMapping used, so that what it kept is found again)
 fn storage_key(game: &Game) -> String {
@@ -626,8 +721,21 @@ impl eframe::App for App {
                 }
             });
         }
+        self.reference_pane(ui);
         egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_gray(17))).show(ui, |ui| match self.doc.as_mut() {
-            Some(doc) => map_view::show(ui, doc, &mut self.settings),
+            Some(doc) => {
+                let beside = self.settings.show_reference && doc.reference.as_ref().is_some_and(|r| r.map.is_some());
+                if beside {
+                    map_header(ui, doc);
+                }
+                map_view::show(ui, doc, &mut self.settings);
+                // the strip over the map grows or shrinks until both maps begin at the same height
+                let off = doc.reference_top - doc.map_top;
+                if beside && off.abs() > 0.1 {
+                    doc.strip = (doc.strip + off).clamp(0.0, 200.0);
+                    ui.ctx().request_repaint();
+                }
+            }
             None => self.welcome(ui),
         });
 
@@ -640,6 +748,9 @@ impl eframe::App for App {
             painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Drop to open", egui::FontId::proportional(28.0), Color32::WHITE);
         }
 
+        if let Some(text) = self.doc.as_mut().and_then(|d| d.notice.take()) {
+            self.say(text);
+        }
         self.dialogs(&ctx, frame);
         self.keep_edits(frame);
         self.update_title(&ctx);
