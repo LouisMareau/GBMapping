@@ -589,10 +589,13 @@ impl App {
         pane.frame(egui::Frame::new().fill(Color32::from_gray(17))).show(ui, |ui| {
             let header = egui::Frame::new().fill(ui.visuals().panel_fill).inner_margin(egui::Margin::symmetric(8, 0));
             let action = header.show(ui, |ui| reference::header(ui, doc, &self.files)).inner;
-            if let Some(reference::Action::Own) = action {
-                doc.reference = Reference::own(&doc.game, &doc.file_name);
+            if let Some(reference::Action::Own { originals }) = action {
+                if !doc.reference.as_ref().is_some_and(|r| r.own) {
+                    doc.reference = Reference::own(&doc.game, &doc.file_name);
+                }
                 if let (Some(reference), Some(map)) = (doc.reference.as_mut(), doc.map.as_ref()) {
                     reference.follow_map(&doc.game, map.index);
+                    reference.set_originals(originals);
                 }
             }
             map_view::show_reference(ui, doc, &mut self.settings);

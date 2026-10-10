@@ -1,20 +1,31 @@
 //! The same checks on real ROMs, which can't be in the repository: name them in
 //! GBMAPPING_TEST_ROMS (paths separated by `;`) and they're opened, drawn and edited.
+//! A ROM's profile goes after it, behind a `|`: what the profile tells is checked too.
 //!
-//!     GBMAPPING_TEST_ROMS="emerald.gba;my-hack.gba" cargo test -p gbmapping-core --test roms -- --nocapture
+//!     GBMAPPING_TEST_ROMS="emerald.gba;my-hack.gba|my-hack.json" cargo test -p gbmapping-core --test roms -- --nocapture
 
 use gbmapping_core::format::block;
 use gbmapping_core::{Edits, Game, MapId, Profile};
+use std::collections::BTreeSet;
 
-fn roms() -> Vec<(String, Vec<u8>)> {
+/// The ROMs named, each with its profile's text when it has one
+fn named() -> Vec<(String, Vec<u8>, Option<String>)> {
     let Ok(list) = std::env::var("GBMAPPING_TEST_ROMS") else {
         eprintln!("GBMAPPING_TEST_ROMS isn't set: nothing checked");
         return Vec::new();
     };
+    let read = |path: &str| std::fs::read(path.trim()).unwrap_or_else(|e| panic!("{path}: {e}"));
     list.split(';')
-        .filter(|p| !p.trim().is_empty())
-        .map(|p| (p.trim().to_string(), std::fs::read(p.trim()).unwrap_or_else(|e| panic!("{p}: {e}"))))
+        .filter(|entry| !entry.trim().is_empty())
+        .map(|entry| {
+            let (rom, profile) = entry.split_once('|').map_or((entry, None), |(rom, profile)| (rom, Some(profile)));
+            (rom.trim().to_string(), read(rom), profile.map(|p| String::from_utf8(read(p)).expect("a profile is text")))
+        })
         .collect()
+}
+
+fn roms() -> Vec<(String, Vec<u8>)> {
+    named().into_iter().map(|(path, bytes, _)| (path, bytes)).collect()
 }
 
 #[test]
@@ -94,5 +105,51 @@ fn edits_survive_the_trip_through_a_file() {
         assert!(copy.rom.bytes() == game.rom.bytes(), "{path}: the copy differs");
         while game.undo().is_some() {}
         assert!(!game.modified(), "{path}: undoing everything gives the ROM back");
+    }
+}
+
+#[test]
+fn the_maps_originals_come_with_their_own_tilesets() {
+    for (path, bytes, profile) in named() {
+        let Some(profile) = profile else { continue };
+        let game = Game::open(bytes, &path, Profile::from_json(&profile).unwrap()).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let originals: Vec<usize> = (0..game.maps.len()).filter(|&i| game.maps[i].original.is_some()).collect();
+        let told = game.profile.groups.iter().flat_map(|g| &g.maps).filter(|m| m.original().is_some()).count();
+        assert_eq!(originals.len(), told, "{path}: every original the profile tells is a layout of the ROM");
+        if originals.is_empty() {
+            println!("{path}: its profile tells no original");
+            continue;
+        }
+        let mut pairs = BTreeSet::new();
+        for &index in &originals {
+            let name = &game.maps[index].name;
+            let map = game.load_map(index).unwrap();
+            let original = game.load_original(index).unwrap();
+            assert_eq!((original.index, original.id), (index, map.id));
+            assert_ne!(original.layout.offset, map.layout.offset, "{path}: {name}'s original is the map itself");
+            assert_eq!(original.blocks.len(), original.width * original.height);
+            // the map was redrawn, not resized: its original lies under it tile for tile
+            assert_eq!((original.width, original.height), (map.width, map.height), "{path}: {name}");
+            // every metatile the original uses is one its own tilesets hold
+            let used: BTreeSet<u16> = original.blocks.iter().chain(&original.border).map(|&b| block::metatile(b)).collect();
+            let missing: Vec<u16> = used.into_iter().filter(|&id| game.locate(original.pair, id).is_none()).collect();
+            assert!(missing.is_empty(), "{path}: {name}'s original uses metatiles its tilesets don't hold: {missing:?}");
+            pairs.insert(original.pair);
+        }
+        // those tilesets are drawn, and they aren't the ones the maps are on now
+        let now = game.pairs();
+        let own = pairs.iter().filter(|pair| !now.contains(pair)).count();
+        assert!(own > 0, "{path}: the originals are on the tilesets the maps are on now");
+        for &pair in &pairs {
+            let sheet = game.render_sheet(pair, 16);
+            assert!(sheet.rgba.chunks(4).any(|p| p[..3] != sheet.rgba[..3]), "{path}: a blank tileset pair for an original");
+        }
+        let edited = game.collect_edits();
+        assert!(edited.is_empty(), "{path}: looking at the originals changes nothing");
+        println!(
+            "{path}: {} maps come with their original, on {} tileset pairs ({own} of them no map is on now)",
+            originals.len(),
+            pairs.len()
+        );
     }
 }

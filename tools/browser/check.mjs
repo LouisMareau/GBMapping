@@ -14,6 +14,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:f
 import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Browser } from './cdp.mjs';
+import { decodePng, difference } from './png.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const dist = join(root, 'dist');
@@ -42,6 +43,10 @@ const tile = (x, y) => [242 + x * 16 * ZOOM + 8 * ZOOM, 46 + y * 16 * ZOOM + 8 *
 /// three columns are whole in each; `across` is how far into the tile to aim.
 const besideTile = (x, y, across = 0.5) => [242 + (x + across) * 16 * ZOOM, 97 + (y + 0.5) * 16 * ZOOM];
 const referenceTile = (x, y, across = 0.5) => [682 + (x + across) * 16 * ZOOM, 97 + (y + 0.5) * 16 * ZOOM];
+/// Where the two maps' top left corners are then
+const [mapCorner, referenceCorner] = [[242, 97], [682, 97]];
+/// The reference's source menu, and its entries when the ROM keeps its maps' originals
+const referenceSource = { menu: [WIDTH - 292 - 193, 47], originals: [WIDTH - 292 - 273, 72], opened: [WIDTH - 292 - 273, 93] };
 /// The "Apply them" button of the kept edits' dialog, from the middle of the page
 const applyKept = [WIDTH / 2 - 174, HEIGHT / 2 + 37];
 
@@ -177,6 +182,37 @@ try {
   const found = await browser.evaluate('document.title');
   check('a map found by the search opens', found !== title, found);
   await shot('another-map');
+
+  // -- the maps' originals, when the profile tells where the ROM keeps them -------------------------
+  const told = profile ? JSON.parse(readFileSync(profile, 'utf8')) : {};
+  const kept = (told.groups ?? []).flatMap((group) => group.maps).find((map) => map && map.original);
+  if (kept) {
+    await browser.click(...searchBox);
+    await browser.key('a', { ctrl: true });
+    await browser.type(kept.name);
+    await browser.click(...firstMap);
+    const shown = await browser.evaluate('document.title');
+    check('a map that comes with its original opens', shown.startsWith(`${kept.name} ·`), shown);
+    await browser.key('r');
+    // how much of the map's pane differs from the reference's, tile facing tile (the pointer out of the way)
+    const apart = async (name) => {
+      await browser.move(WIDTH / 2, HEIGHT - 8);
+      await browser.wait(700);
+      const picture = decodePng(readFileSync(await browser.screenshot(join(out, `${String(++step).padStart(2, '0')}-${name}.png`))));
+      return difference(picture, mapCorner, referenceCorner, 380, 640);
+    };
+    const original = await apart('original');
+    check('the reference shows the original, on its own tilesets: not what the map looks like now', original > 0.25, `${(original * 100).toFixed(1)}% of the pixels differ`);
+    await browser.click(...referenceSource.menu);
+    await browser.click(...referenceSource.opened);
+    const opened = await apart('as-opened');
+    check('asked for the ROM as it was opened, it shows the map itself', opened < 0.01, `${(opened * 100).toFixed(1)}% of the pixels differ`);
+    await browser.click(...referenceSource.menu);
+    await browser.click(...referenceSource.originals);
+    const again = await apart('original-again');
+    check('and the original again when asked', Math.abs(again - original) < 0.01, `${(again * 100).toFixed(1)}%`);
+    await browser.key('r');
+  }
 
   // -- the edits are kept from one visit to the next --------------------------------------------
   await browser.wait(500);

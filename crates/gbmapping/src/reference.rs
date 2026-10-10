@@ -1,7 +1,9 @@
 //! The reference: a second, read-only view next to the map being edited. It shows the
-//! same map as it was when the ROM was opened, or the map it comes from in another ROM
-//! (the original game, an earlier build that still had the original tiles), drawn with
-//! that ROM's own tilesets. The work to redo is on one side, the model on the other.
+//! map's original when the ROM keeps one (the map as it was before the hack redrew it,
+//! on the tilesets it came with), else the same map as it was when the ROM was opened,
+//! or the map it comes from in another ROM (the original game, an earlier build). Always
+//! with the tilesets that go with what's shown. The work to redo is on one side, the
+//! model on the other.
 
 use crate::doc::{Doc, Hover, Sheet};
 use crate::files::{Files, Kind, Purpose};
@@ -15,6 +17,9 @@ pub struct Reference {
     pub label: String,
     /// It's the edited ROM itself, as it was opened
     pub own: bool,
+    /// Its maps are shown as they were before the hack redrew them, where the ROM keeps
+    /// that (see `MapInfo::original`): on their original tilesets
+    pub originals: bool,
     /// Its map keeps to the edited one
     pub follow: bool,
     pub map: Option<Map>,
@@ -29,13 +34,14 @@ pub struct Reference {
 
 /// What the header's controls ask for
 pub enum Action {
-    /// Back to this ROM as it was opened
-    Own,
+    /// This ROM as the reference: its maps' originals, or its maps as they were opened
+    Own { originals: bool },
 }
 
 impl Reference {
     fn new(game: Game, label: String, own: bool) -> Self {
         Self {
+            originals: game.maps.iter().any(|m| m.original.is_some()),
             game,
             label,
             own,
@@ -49,7 +55,8 @@ impl Reference {
         }
     }
 
-    /// The edited ROM as it was opened: every map before the edits
+    /// The edited ROM as it was opened: every map before the edits, and before the hack
+    /// redrew it when the ROM keeps the maps' originals
     pub fn own(edited: &Game, file_name: &str) -> Option<Self> {
         let game = Game::open(edited.original().bytes().to_vec(), file_name, edited.profile.clone()).ok()?;
         Some(Self::new(game, file_name.to_string(), true))
@@ -68,9 +75,27 @@ impl Reference {
         self.followed = Some(index);
         // the same ROM has the same maps in the same order
         let counterpart = if self.own { Some(index) } else { self.game.counterpart(edited, index) };
-        self.map = counterpart.and_then(|i| self.game.load_map(i));
+        self.show(counterpart);
+    }
+
+    /// Shows one of its maps: its original when that's what's wanted and the ROM keeps
+    /// one, else the map as it is in the ROM. Either way with the layout's own tilesets.
+    fn show(&mut self, index: Option<usize>) {
+        let original = |i: usize| if self.originals { self.game.load_original(i) } else { None };
+        self.map = index.and_then(|i| original(i).or_else(|| self.game.load_map(i)));
         self.hover = None;
         self.picking = None;
+    }
+
+    /// Originals or not: the map shown stays, in its other state
+    pub fn set_originals(&mut self, originals: bool) {
+        self.originals = originals;
+        self.show(self.map.as_ref().map(|m| m.index));
+    }
+
+    /// Is what's shown a map's original (and not the map as it is in the ROM)?
+    pub fn shows_original(&self) -> bool {
+        self.map.as_ref().is_some_and(|m| self.game.maps.get(m.index).is_some_and(|info| info.layout.offset != m.layout.offset))
     }
 
     /// Matches its map again (after the ROM being edited changed)
@@ -81,9 +106,7 @@ impl Reference {
     /// Shows a map of its own choosing, and stays there
     fn open_map(&mut self, index: usize) {
         self.follow = false;
-        self.map = self.game.load_map(index);
-        self.hover = None;
-        self.picking = None;
+        self.show(Some(index));
     }
 
     pub fn sheet(&mut self, ctx: &egui::Context, pair: Pair) -> &Sheet {
@@ -98,16 +121,20 @@ impl Reference {
 
     /// What it is, in a few words
     pub fn source(&self) -> String {
-        if self.own {
-            "This ROM, as it was opened".to_string()
-        } else {
-            self.label.clone()
+        match (self.own, self.originals) {
+            (true, true) => OWN_ORIGINALS.to_string(),
+            (true, false) => OWN_OPENED.to_string(),
+            _ => self.label.clone(),
         }
     }
 }
 
+const OWN_ORIGINALS: &str = "This ROM: the maps' originals";
+const OWN_OPENED: &str = "This ROM, as it was opened";
+
 /// The reference pane's two lines of controls: where it comes from, which map it shows
 pub fn header(ui: &mut Ui, doc: &mut Doc, files: &Files) -> Option<Action> {
+    let keeps_originals = doc.game.maps.iter().any(|m| m.original.is_some());
     let reference = doc.reference.as_mut()?;
     let mut action = None;
     ui.add_space(4.0);
@@ -116,8 +143,16 @@ pub fn header(ui: &mut Ui, doc: &mut Doc, files: &Files) -> Option<Action> {
             "Read-only: what the map looked like, to work from. Scrolls and zooms with the map.\nRight-click or right-drag it to take what's there as the stamp.",
         );
         egui::ComboBox::from_id_salt("reference source").selected_text(reference.source()).width(ui.available_width() - 8.0).truncate().show_ui(ui, |ui| {
-            if ui.selectable_label(reference.own, "This ROM, as it was opened").on_hover_text("Every map before your edits").clicked() && !reference.own {
-                action = Some(Action::Own);
+            if keeps_originals
+                && ui
+                    .selectable_label(reference.own && reference.originals, OWN_ORIGINALS)
+                    .on_hover_text("Each map as it was before it was redrawn with this game's tilesets, on the tilesets it came with. A map without an original is shown as it was opened.")
+                    .clicked()
+            {
+                action = Some(Action::Own { originals: true });
+            }
+            if ui.selectable_label(reference.own && !reference.originals, OWN_OPENED).on_hover_text("Every map before your edits").clicked() {
+                action = Some(Action::Own { originals: false });
             }
             if !reference.own {
                 let _ = ui.selectable_label(true, &reference.label);
@@ -133,6 +168,8 @@ pub fn header(ui: &mut Ui, doc: &mut Doc, files: &Files) -> Option<Action> {
     });
     ui.horizontal(|ui| {
         let shown = match &reference.map {
+            Some(map) if reference.shows_original() => format!("{}  ({})  ·  original", map.name, map.id),
+            Some(map) if reference.own && reference.originals => format!("{}  ({})  ·  no original: as opened", map.name, map.id),
             Some(map) => format!("{}  ({})", map.name, map.id),
             None => "No map like this one: choose…".to_string(),
         };

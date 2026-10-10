@@ -1,8 +1,10 @@
 //! Lists a ROM's maps and draws one, without a browser:
 //!
-//!     cargo run -p gbmapping-core --example inspect -- <rom.gba> [profile.json] [map id] [out.png]
+//!     cargo run -p gbmapping-core --example inspect -- <rom.gba> [profile.json] [map id] [original] [out.png]
 //!
 //! With a .png and no map id, the tileset pair of the first map is drawn instead.
+//! `original` draws the map as it was before the hack redrew it, when the profile tells
+//! where the ROM keeps it.
 
 use gbmapping_core::{Game, Image, MapId, Profile};
 use std::time::Instant;
@@ -19,15 +21,17 @@ fn save_png(path: &str, image: &Image) {
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(rom_path) = args.next() else {
-        eprintln!("usage: inspect <rom.gba> [profile.json] [map id] [out.png]");
+        eprintln!("usage: inspect <rom.gba> [profile.json] [map id] [original] [out.png]");
         std::process::exit(2);
     };
-    let (mut profile, mut map_id, mut out) = (Profile::default(), None, None);
+    let (mut profile, mut map_id, mut out, mut original) = (Profile::default(), None, None, false);
     for a in args {
         if a.ends_with(".json") {
             profile = Profile::from_json(&std::fs::read_to_string(&a).expect("can't read the profile")).expect("bad profile");
         } else if a.ends_with(".png") {
             out = Some(a);
+        } else if a == "original" {
+            original = true;
         } else {
             map_id = Some(a.parse::<MapId>().expect("bad map id"));
         }
@@ -69,8 +73,13 @@ fn main() {
             m.header.mapsec
         );
     }
+    let originals = game.maps.iter().filter(|m| m.original.is_some()).count();
+    if originals > 0 {
+        println!("{originals} maps come with their original");
+    }
     let index = map_id.map(|id| game.map_index(id).expect("no such map"));
-    if let Some(map) = index.and_then(|i| game.load_map(i)) {
+    let load = |i: usize| if original { game.load_original(i) } else { game.load_map(i) };
+    if let Some(map) = index.and_then(load) {
         let primary = game.tileset(map.pair.primary).unwrap();
         let secondary = game.tileset(map.pair.secondary).unwrap();
         println!(

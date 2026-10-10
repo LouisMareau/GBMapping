@@ -107,6 +107,8 @@ impl Builder {
 struct Synth {
     bytes: Vec<u8>,
     groups_table: usize,
+    /// The layouts table: the first map's layout, the two others', nothing, and the first map as it was before
+    layouts_table: usize,
     primary: usize,
     secondary: usize,
     first_secondary: u16,
@@ -158,6 +160,10 @@ fn synth_with(code: &str, kanto: bool, wide: bool) -> Synth {
         primary,
         secondary,
     );
+    // the first map as it was before, on a pair of its own (the secondary tileset twice): a layout no map uses
+    let before = [first_secondary, first_secondary, 1, 0, 0, first_secondary + 1];
+    let layout_before = b.layout(3, 2, &border, (3, 2), &before, secondary, secondary);
+    let layouts_table = b.words(&[p(layout_a), p(layout_b), 0, p(layout_before), 0x1234_5678]);
     let section = if kanto { 0x58 } else { 0 };
     let headers = [b.header(layout_a, section + 2), b.header(layout_b, section + 3), b.header(layout_b, section + 3)];
     let group0 = b.words(&[p(headers[0]), p(headers[1])]);
@@ -181,7 +187,7 @@ fn synth_with(code: &str, kanto: bool, wide: bool) -> Synth {
         }
     }
     b.words(&[0, 0]);
-    Synth { bytes: b.bytes, groups_table, primary, secondary, first_secondary }
+    Synth { bytes: b.bytes, groups_table, layouts_table, primary, secondary, first_secondary }
 }
 
 fn open(s: &Synth) -> Game {
@@ -481,5 +487,46 @@ fn the_closest_looking_metatile() {
         let corner = sheet.crop(sheet.width - 8, 0, 16, 16);
         assert_eq!(corner.pixel(8, 0)[3], 0);
         assert_eq!(corner.pixel(7, 0), sheet.pixel(sheet.width - 1, 0));
+    }
+}
+
+#[test]
+fn a_map_comes_with_its_original_when_the_profile_tells_where() {
+    for (s, family) in both() {
+        // nothing told: no original
+        assert!(open(&s).maps.iter().all(|m| m.original.is_none()));
+        assert!(open(&s).load_original(0).is_none());
+
+        let profile = |maps: &str| {
+            let json = format!(
+                r#"{{"gMapLayouts": {}, "groups": [{{"name": "A", "maps": [{maps}]}}, {{"name": "B", "maps": ["C"]}}]}}"#,
+                s.layouts_table
+            );
+            Game::open(s.bytes.clone(), "synth.gba", Profile::from_json(&json).unwrap()).unwrap()
+        };
+        let game = profile(r#"{"name": "A", "layout": 1, "original": 4}, {"name": "B", "layout": 2}"#);
+        assert_eq!(game.layout_by_id(1).map(|l| l.offset), Some(game.maps[0].layout.offset), "{family:?}");
+        let (map, original) = (game.load_map(0).unwrap(), game.load_original(0).unwrap());
+        assert_eq!((original.index, original.id, &original.name), (0, map.id, &map.name));
+        assert_eq!((original.width, original.height), (3, 2));
+        assert_eq!(original.blocks, [s.first_secondary, s.first_secondary, 1, 0, 0, s.first_secondary + 1]);
+        assert_ne!(original.blocks, map.blocks);
+        // on its own tilesets: the secondary one in the primary's place too
+        assert_eq!((original.pair.primary, original.pair.secondary), (s.secondary, s.secondary));
+        assert_ne!(original.pair, map.pair);
+        assert_eq!(game.render_map(&original).pixel(0, 0), [0, 0, 255, 255], "drawn with them: blue where the map is red");
+        assert_eq!(game.render_map(&map).pixel(0, 0), [255, 0, 0, 255]);
+        // the other maps have none, and the game's own pairs are the maps' alone
+        assert!(game.maps[1].original.is_none() && game.load_original(1).is_none() && game.load_original(9).is_none());
+        assert_eq!(game.pairs().len(), 1);
+
+        // ids that are no layout: nothing there, past the table, not a pointer, the map's own layout
+        for id in [0, 3, 5, 6, 400, 1] {
+            let game = profile(&format!(r#"{{"name": "A", "original": {id}}}, "B""#));
+            assert!(game.maps[0].original.is_none(), "{family:?}: id {id}");
+        }
+        // and without the table's address, ids mean nothing
+        let json = r#"{"groups": [{"name": "A", "maps": [{"name": "A", "original": 4}, "B"]}]}"#;
+        assert!(Game::open(s.bytes.clone(), "synth.gba", Profile::from_json(json).unwrap()).unwrap().maps[0].original.is_none());
     }
 }

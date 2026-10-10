@@ -49,6 +49,9 @@ pub struct MapInfo {
     pub group_name: String,
     pub header: Header,
     pub layout: Layout,
+    /// The map as it was before the hack redrew it, on the tilesets it came with: a
+    /// layout no map uses, that the profile points to
+    pub original: Option<Layout>,
 }
 
 /// A map being edited: a copy of its blocks and border, stored back with `Game::store_map`
@@ -321,10 +324,18 @@ impl Game {
                     .or_else(|| original.get(g).map(|&(name, _)| name))
                     .map(str::to_string)
                     .unwrap_or_else(|| format!("Group {g}"));
-                maps.push(MapInfo { id, name, section, group_name, header, layout });
+                let original =
+                    self.profile.original_layout(g, n).and_then(|id| self.layout_by_id(id)).filter(|o| o.offset != layout.offset);
+                maps.push(MapInfo { id, name, section, group_name, header, layout, original });
             }
         }
         maps
+    }
+
+    /// A layout by its id: the entry `id - 1` of the layouts table the profile gives
+    pub fn layout_by_id(&self, id: usize) -> Option<Layout> {
+        let reader = self.reader();
+        reader.layout(reader.aligned(self.profile.map_layouts? + id.checked_sub(1)? * 4)?)
     }
 
     /// A region map section's name: the profile's, else the ROM's
@@ -376,8 +387,18 @@ impl Game {
     // -- maps -------------------------------------------------------------------
 
     pub fn load_map(&self, index: usize) -> Option<Map> {
+        self.map_of(index, self.maps.get(index)?.layout)
+    }
+
+    /// A map as it was before the hack redrew it, when the ROM keeps it (see
+    /// `MapInfo::original`): its blocks then, on its tilesets then. To look at: it's
+    /// no map of the game's.
+    pub fn load_original(&self, index: usize) -> Option<Map> {
+        self.map_of(index, self.maps.get(index)?.original?)
+    }
+
+    fn map_of(&self, index: usize, l: Layout) -> Option<Map> {
         let info = self.maps.get(index)?;
-        let l = info.layout;
         let read = |at: usize, count: usize| (0..count).map(|i| self.rom.u16(at + i * 2)).collect::<Vec<u16>>();
         Some(Map {
             index,
