@@ -1,8 +1,11 @@
 //! A tiny made-up ROM per family, laid out like the games lay theirs: everything the
 //! core does, checked without a copyrighted byte.
 
+use gbmapping_core::edits::NewTileset;
 use gbmapping_core::format::block;
-use gbmapping_core::metatiles::GrowError;
+use gbmapping_core::gfx::TileEntry;
+use gbmapping_core::metatiles::{GrowError, MoveError};
+use gbmapping_core::pixels::DrawError;
 use gbmapping_core::text;
 use gbmapping_core::tiles::{BorrowError, Borrowed, Colors};
 use gbmapping_core::{closest_metatile, Edits, Family, Game, Image, MapId, OpenError, Profile};
@@ -680,13 +683,27 @@ fn a_tile_that_cannot_be_brought_changes_nothing() {
         assert_eq!(cramped.import_tile(pair, &pixels, &colors), Err(BorrowError::NoRoom), "{family:?}");
         assert!(!cramped.commit() && !cramped.modified());
 
-        // a secondary tileset with every tile it can hold
+        // a secondary tileset with every tile it can hold gives one no metatile draws
         let mut full = open(&s);
+        let first = full.format.primary_tiles as u16;
         let secondary = full.tileset(s.secondary).unwrap();
         assert_eq!(full.store_tiles(&secondary, &vec![0x11; most * 32]), Ok(()));
         assert_eq!(full.tileset_tile_count(pair, true), most);
         full.commit();
-        assert_eq!(full.import_tile(pair, &pixels, &colors), Err(BorrowError::Full { tiles: most }));
+        let given = full.import_tile(pair, &pixels, &colors).unwrap();
+        assert_eq!((given.tile, given.existing, full.tileset_tile_count(pair, true)), (first + 1, false, most), "{family:?}");
+        assert!(full.undo().is_some(), "{family:?}: the tile is taken back");
+        // until its metatiles draw them all (but the last ones, the game's own for its doors)
+        let room = most - 16;
+        for i in 0..room.div_ceil(8) {
+            let id = match full.metatile_count(pair) {
+                count if count > first as usize + i => first + i as u16,
+                _ => full.add_metatile(pair, None).unwrap(),
+            };
+            full.set_entries(pair, id, &std::array::from_fn(|k| first + ((i * 8 + k) % room) as u16));
+        }
+        full.commit();
+        assert_eq!((full.free_tiles(pair), full.import_tile(pair, &pixels, &colors)), (0, Err(BorrowError::Full { tiles: most })));
         assert!(!full.commit(), "not even the palette");
         // tiles that aren't compressed can't be told from what follows them
         let primary = full.tileset(s.primary).unwrap();
@@ -787,5 +804,242 @@ fn a_tileset_is_given_new_metatiles() {
         let mut cramped = Game::open(s.bytes[..s.bytes.len() - FREE].to_vec(), "synth.gba", Profile::default()).unwrap();
         assert_eq!(cramped.add_metatile(pair, None), Err(GrowError::NoRoom));
         assert!(!cramped.commit() && !cramped.modified());
+    }
+}
+
+#[test]
+fn pixels_are_drawn_on_a_metatile() {
+    for (s, family) in both() {
+        let mut game = open(&s);
+        let pair = game.maps[0].layout.pair();
+        // the secondary tileset's first metatile is its first tile four times, in its first palette
+        let first = s.first_secondary;
+        let own = game.format.primary_palettes as u8;
+        assert_eq!((game.layer_pixels(pair, first, 0)[0], game.layer_pixels(pair, first, 1)[0]), ((1, own), (0, 0)), "{family:?}");
+        assert_eq!((game.tile_entries(pair, first), game.tile_entries(pair, 1), game.tile_entries(pair, 999)), (4, 4, 0));
+        assert!(game.free_tiles(pair) > 0);
+        assert!(game.set_color(pair, own as usize, 2, 0x03E0) && !game.set_color(pair, 16, 2, 0));
+
+        // drawn on for itself: a quarter that shares its tile gets its own first, and the
+        // other quarters keep theirs
+        assert_eq!(game.draw_on_metatile(pair, first, 0, &[(0, 0, 2), (1, 0, 0)], true), Ok(true), "{family:?}");
+        let entries = game.entries(pair, first).map(TileEntry::unpack);
+        assert_eq!((entries[0].tile, entries[1].tile, entries[0].palette), (first + 1, first, own));
+        let pixels = game.layer_pixels(pair, first, 0);
+        assert_eq!([pixels[0].0, pixels[1].0, pixels[2].0, pixels[8].0, pixels[16].0], [2, 0, 1, 1, 1]);
+        assert_eq!(game.tileset_tile_count(pair, true), 2);
+        // the quarter's tile is its own now: nothing more is copied
+        assert_eq!(game.draw_on_metatile(pair, first, 0, &[(7, 7, 3)], true), Ok(true));
+        assert_eq!((game.tileset_tile_count(pair, true), game.layer_pixels(pair, first, 0)[7 * 16 + 7].0), (2, 3));
+        // a pixel that has its colour, a pixel outside: nothing to do
+        assert_eq!(game.draw_on_metatile(pair, first, 0, &[(0, 0, 2), (16, 0, 5)], true), Ok(false));
+        assert!(game.commit());
+        // on the map: the colour drawn, and the tile's own next to it
+        let map = game.render_map(&game.load_map(0).unwrap());
+        assert_eq!(
+            (map.pixel(32, 0), map.pixel(34, 0), map.pixel(40, 0)),
+            ([0, 255, 0, 255], [0, 0, 255, 255], [0, 0, 255, 255]),
+            "{family:?}"
+        );
+
+        // a primary tileset's metatile shares its tiles and can't have its own
+        assert_eq!(game.draw_on_metatile(pair, 1, 0, &[(0, 0, 2)], true), Err(DrawError::Primary));
+        assert!(!game.commit(), "{family:?}: nothing was done");
+        // the tile itself is drawn on, then: every quarter that has it shows it (these tiles aren't compressed)
+        assert_eq!(game.draw_on_metatile(pair, 1, 0, &[(0, 0, 2)], false), Ok(true));
+        let pixels = game.layer_pixels(pair, 1, 0);
+        assert_eq!([pixels[0].0, pixels[8].0, pixels[8 * 16].0, pixels[1].0], [2, 2, 2, 1]);
+        let map = game.render_map(&game.load_map(0).unwrap());
+        assert_eq!((map.pixel(0, 0), map.pixel(8, 0), map.pixel(1, 0)), ([0, 255, 0, 255], [0, 255, 0, 255], [255, 0, 0, 255]));
+
+        // a tile drawn flipped is drawn on where the pixel is seen
+        let mut entries = game.entries(pair, first + 1);
+        entries[0] = TileEntry { tile: first, hflip: true, vflip: true, palette: own }.pack();
+        game.set_entries(pair, first + 1, &entries);
+        assert_eq!(game.draw_on_metatile(pair, first + 1, 0, &[(0, 0, 5)], false), Ok(true));
+        assert_eq!(
+            game.layer_pixels(pair, first, 0)[7 * 16 + 15].0,
+            5,
+            "{family:?}: the first metatile's second quarter is that tile, not flipped"
+        );
+        assert!(game.commit());
+
+        // the edits tell the tiles and the colour, and give them to another copy of the ROM
+        let edits = game.collect_edits();
+        let told = |offset: usize| &edits.tilesets[&format!("0x{offset:06X}")];
+        assert_eq!((told(s.primary).tiles.len(), told(s.secondary).tiles.len(), told(s.secondary).palettes.len()), (1, 2, 1), "{family:?}");
+        let mut other = open(&s);
+        let applied = other.apply_edits(&Edits::from_json(&edits.to_json()).unwrap());
+        assert!(applied.skipped.is_empty(), "{family:?}: {:?}", applied.skipped);
+        other.commit();
+        assert!(other.collect_edits() == edits && other.render_sheet(pair, 8) == game.render_sheet(pair, 8), "{family:?}");
+
+        while game.undo().is_some() {}
+        assert!(!game.modified(), "{family:?}: all undone");
+
+        // a secondary tileset with no room for more: the quarter's own tile is one no metatile draws
+        let secondary = game.tileset(s.secondary).unwrap();
+        let most = game.format.secondary_tiles() - 16;
+        let mut tiles = vec![0x11; most * 32];
+        tiles[5 * 32..6 * 32].fill(0);
+        assert_eq!(game.store_tiles(&secondary, &tiles), Ok(()));
+        game.commit();
+        assert_eq!(game.free_tiles(pair), most - 1, "{family:?}: every tile but the one the first metatile draws");
+        assert_eq!(game.draw_on_metatile(pair, first, 0, &[(0, 0, 2)], true), Ok(true));
+        // an empty one first
+        assert_eq!((TileEntry::unpack(game.entries(pair, first)[0]).tile, game.tileset_tile_count(pair, true)), (first + 5, most));
+        assert_eq!((game.layer_pixels(pair, first, 0)[0].0, game.layer_pixels(pair, first, 0)[1].0), (2, 1));
+        assert!(game.commit());
+    }
+}
+
+#[test]
+fn a_map_is_given_tilesets_of_its_own() {
+    for (s, family) in both() {
+        let mut game = open(&s);
+        let pair = game.maps[0].layout.pair();
+        let layout = game.maps[0].layout.offset;
+        let first = s.first_secondary;
+        let pictures: Vec<Image> = (0..3).map(|i| game.render_map(&game.load_map(i).unwrap())).collect();
+        let same = |game: &Game, others: &[Image]| (0..3).all(|i| game.render_map(&game.load_map(i).unwrap()) == others[i]);
+
+        // a copy of the first map's secondary tileset: new in the ROM, and no map's yet
+        let copy = game.duplicate_tileset(pair.secondary, false).unwrap();
+        assert!(copy >= s.bytes.len() - FREE && game.is_new_tileset(copy) && !game.is_new_tileset(pair.secondary), "{family:?}");
+        assert_eq!((game.copied_from(copy), game.copied_from(pair.secondary), game.pairs().len()), (Some(pair.secondary), None, 1));
+        assert!(game.tileset_content(copy, false) == game.tileset_content(pair.secondary, false), "{family:?}");
+        // given to the first map's layout: that map is drawn with it, the others aren't
+        assert!(game.set_layout_tileset(layout, false, copy) && game.commit());
+        let own = game.maps[0].layout.pair();
+        assert_eq!(
+            (own.primary, own.secondary, game.maps[1].layout.pair(), game.pairs().len()),
+            (pair.primary, copy, pair, 2),
+            "{family:?}"
+        );
+        assert!(same(&game, &pictures), "{family:?}: every map looks as it did");
+
+        // what's changed in the copy changes that map alone
+        let red = game.entries(own, 1);
+        game.set_entries(own, first, &red);
+        assert!(game.commit());
+        assert_eq!((game.render_map(&game.load_map(0).unwrap()).pixel(32, 0), game.entries(pair, first) == red), ([255, 0, 0, 255], false));
+        // and its metatiles are added to where they are: they're the last thing it's made of
+        let metatiles = game.tileset(copy).unwrap().metatiles;
+        assert_eq!((game.add_metatile(own, None), game.tileset(copy).unwrap().metatiles), (Ok(first + 2), metatiles));
+        assert!(game.commit());
+
+        // the edits tell the map its tileset, and the tileset whole
+        let edits = game.collect_edits();
+        let key = format!("0x{copy:06X}");
+        assert_eq!(
+            (edits.maps.len(), edits.maps["0.0"].primary.clone(), edits.maps["0.0"].secondary.clone()),
+            (1, None, Some(key.clone())),
+            "{family:?}"
+        );
+        let told = &edits.tilesets[&key];
+        assert_eq!(told.new, Some(NewTileset { secondary: true, copy_of: Some(format!("0x{:06X}", pair.secondary)) }));
+        assert_eq!(
+            (edits.tilesets.len(), told.metatiles.len(), told.attributes.len(), told.tiles.len(), told.palettes.len()),
+            (1, 3, 3, 1, 16)
+        );
+        // another copy of the ROM is given them
+        let mut other = open(&s);
+        let applied = other.apply_edits(&Edits::from_json(&edits.to_json()).unwrap());
+        assert!(applied.skipped.is_empty(), "{family:?}: {:?}", applied.skipped);
+        other.commit();
+        let theirs = other.maps[0].layout.pair();
+        assert!(
+            theirs.primary == pair.primary && other.is_new_tileset(theirs.secondary) && other.maps[1].layout.pair() == pair,
+            "{family:?}"
+        );
+        assert!(other.tileset_content(theirs.secondary, false) == game.tileset_content(copy, false), "{family:?}");
+        let now: Vec<Image> = (0..3).map(|i| game.render_map(&game.load_map(i).unwrap())).collect();
+        assert!(same(&other, &now), "{family:?}");
+
+        // a primary tileset is copied the same
+        let primary = game.duplicate_tileset(pair.primary, true).unwrap();
+        assert!(game.set_layout_tileset(layout, true, primary) && game.commit());
+        let own = game.maps[0].layout.pair();
+        assert_eq!((own.primary, own.secondary, game.pairs().len()), (primary, copy, 2));
+        assert!(same(&game, &now), "{family:?}");
+
+        // a new one has the palettes of another, and one empty tile and metatile to begin with
+        let empty = game.empty_tileset(pair.secondary).unwrap();
+        let shared = game.maps[1].layout.offset;
+        assert!(game.set_layout_tileset(shared, false, empty) && game.commit());
+        let bare = game.maps[1].layout.pair();
+        assert_eq!(
+            (game.metatile_count(bare), game.tileset_tile_count(bare, true), game.maps[2].layout.pair()),
+            (first as usize + 1, 1, bare),
+            "{family:?}"
+        );
+        assert!(game.raw_palettes(bare) == game.raw_palettes(pair) && game.copied_from(empty).is_none());
+        assert_eq!(game.collect_edits().tilesets[&format!("0x{empty:06X}")].new, Some(NewTileset { secondary: true, copy_of: None }));
+
+        // no such tileset, no such layout
+        assert!(!game.set_layout_tileset(layout, false, 4) && !game.set_layout_tileset(4, false, empty) && !game.commit());
+
+        while game.undo().is_some() {}
+        assert!(!game.modified() && game.maps[0].layout.pair() == pair && game.pairs().len() == 1, "{family:?}: all undone");
+        while game.redo().is_some() {}
+        assert_eq!((game.maps[0].layout.pair(), game.maps[1].layout.pair()), (own, bare), "{family:?}: and done again");
+
+        // a ROM with no unused end
+        let mut cramped = Game::open(s.bytes[..s.bytes.len() - FREE].to_vec(), "synth.gba", Profile::default()).unwrap();
+        assert_eq!(cramped.duplicate_tileset(pair.secondary, false), Err(GrowError::NoRoom));
+        assert!(!cramped.commit() && !cramped.modified());
+    }
+}
+
+#[test]
+fn metatiles_change_places_and_the_maps_follow() {
+    for (s, family) in both() {
+        // the first map comes with its original, drawn with the secondary tileset in the primary's place too
+        let json = format!(
+            r#"{{"gMapLayouts": {}, "groups": [{{"name": "A", "maps": [{{"name": "A", "original": 4}}, "B"]}}, {{"name": "B", "maps": ["C"]}}]}}"#,
+            s.layouts_table
+        );
+        let mut game = Game::open(s.bytes.clone(), "synth.gba", Profile::from_json(&json).unwrap()).unwrap();
+        let pair = game.maps[0].layout.pair();
+        let first = s.first_secondary;
+        let look = |game: &Game| {
+            let mut pictures: Vec<Image> = (0..3).map(|i| game.render_map(&game.load_map(i).unwrap())).collect();
+            pictures.push(game.render_map(&game.load_original(0).unwrap()));
+            pictures
+        };
+        let pictures = look(&game);
+
+        // two of the primary tileset's: what they're made of and their attributes change places
+        let made = [1, 2].map(|id| (game.entries(pair, id), game.attribute(pair, id)));
+        let renumbered = game.swap_metatiles(pair, 1, 2).unwrap();
+        assert_eq!([1, 2].map(|id| (game.entries(pair, id), game.attribute(pair, id))), [made[1], made[0]], "{family:?}");
+        // and the maps' tiles follow, with the collision and elevation they had: nothing looks different
+        assert_eq!(game.load_map(0).unwrap().blocks, [2, 1, first, block::pack(2, 1, 3), block::pack(1, 0, 3), first + 5], "{family:?}");
+        assert!(game.load_map(0).unwrap().border.iter().all(|&b| b == 2) && renumbered > 8, "{family:?}: {renumbered} tiles");
+        assert!(look(&game) == pictures && game.commit(), "{family:?}");
+
+        // two of the secondary's: the original, which has that tileset twice, is renumbered for both
+        let made = [first, first + 1].map(|id| game.entries(pair, id));
+        assert!(game.swap_metatiles(pair, first, first + 1).unwrap() > 0);
+        assert_eq!([first, first + 1].map(|id| game.entries(pair, id)), [made[1], made[0]]);
+        assert_eq!(game.load_map(0).unwrap().blocks[2], first + 1);
+        assert_eq!(game.load_original(0).unwrap().blocks, [first + 1, first + 1, 0, 1, 1, first], "{family:?}");
+        assert!(look(&game) == pictures && game.commit(), "{family:?}");
+
+        // not from one tileset to the other, not where there's no metatile; and one stays where it is
+        assert_eq!(game.swap_metatiles(pair, 1, first), Err(MoveError::Apart));
+        assert_eq!(game.swap_metatiles(pair, 1, first + 9), Err(MoveError::Nothing));
+        assert_eq!((game.swap_metatiles(pair, 2, 2), game.commit()), (Ok(0), false));
+
+        // the edits carry the metatiles and the maps to another copy of the ROM
+        let edits = game.collect_edits();
+        let mut other = Game::open(s.bytes.clone(), "synth.gba", Profile::from_json(&json).unwrap()).unwrap();
+        assert!(other.apply_edits(&Edits::from_json(&edits.to_json()).unwrap()).skipped.is_empty());
+        other.commit();
+        assert_eq!(edits.originals.keys().collect::<Vec<_>>(), ["0.0"], "{family:?}: the original, renumbered, is told too");
+        assert!(look(&other) == pictures && other.collect_edits() == edits, "{family:?}");
+
+        while game.undo().is_some() {}
+        assert!(!game.modified() && look(&game) == pictures, "{family:?}: all undone");
     }
 }

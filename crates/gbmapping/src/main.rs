@@ -6,6 +6,7 @@
 
 mod app;
 mod doc;
+mod draw;
 mod files;
 mod map_view;
 mod reference;

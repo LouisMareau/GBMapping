@@ -12,6 +12,7 @@ use gbmapping_core::{Edits, Game, Profile};
 pub enum Tab {
     Metatiles,
     Tileset,
+    Draw,
 }
 
 /// What's kept from one session to the next
@@ -32,6 +33,8 @@ pub struct Settings {
     pub usual_colors: bool,
     /// The tileset tab lists every tileset's tiles, not only the map's two
     pub all_tilesets: bool,
+    /// Drawing on a metatile changes nothing else: its quarters get tiles of their own
+    pub own_tiles: bool,
     pub tab: Tab,
 }
 
@@ -48,6 +51,7 @@ impl Default for Settings {
             show_reference: false,
             usual_colors: true,
             all_tilesets: false,
+            own_tiles: true,
             tab: Tab::Metatiles,
         }
     }

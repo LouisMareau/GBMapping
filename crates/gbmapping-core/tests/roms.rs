@@ -8,6 +8,7 @@
 use gbmapping_core::format::block;
 use gbmapping_core::gbc::{is_game_boy, quarter};
 use gbmapping_core::metatiles::GrowError;
+use gbmapping_core::pixels::DrawError;
 use gbmapping_core::rom::lz77_compress;
 use gbmapping_core::tiles::{BorrowError, Colors};
 use gbmapping_core::{Edits, Family, Game, MapId, Pair, Profile, Rom};
@@ -386,5 +387,174 @@ fn tilesets_are_given_new_metatiles() {
         assert!(copy.collect_edits() == edits, "{path}: the copy's edits differ");
         assert!(game.undo().is_some() && !game.modified(), "{path}: undone in one step");
         println!("{path}: {} secondary tilesets given a new metatile ({} have all they can)", added.len(), pairs.len() - added.len());
+    }
+}
+
+/// The metatiles of a pair that don't look the same in two games
+fn metatiles_apart(a: &Game, b: &Game, pair: Pair) -> Vec<usize> {
+    let (a, b) = (a.render_sheet(pair, 8), b.render_sheet(pair, 8));
+    assert_eq!((a.width, a.height), (b.width, b.height));
+    let at = |id: usize, i: usize| (id % 8 * 16 + i % 16, id / 8 * 16 + i / 16);
+    let differs = |id: usize| (0..256).any(|i| a.pixel(at(id, i).0, at(id, i).1) != b.pixel(at(id, i).0, at(id, i).1));
+    (0..a.height / 16 * 8).filter(|&id| differs(id)).collect()
+}
+
+#[test]
+fn pixels_are_drawn_on_a_metatile_alone() {
+    for (path, bytes) in roms() {
+        let untouched = Game::open(bytes.clone(), &path, Profile::default()).unwrap();
+        let mut game = Game::open(bytes.clone(), &path, Profile::default()).unwrap();
+        let first = game.format.primary_metatiles as u16;
+        // a metatile of a secondary tileset that a map shows, in a tileset that can take tiles
+        let shown = (0..game.maps.len()).find_map(|index| {
+            let map = game.load_map(index)?;
+            let id = map.blocks.iter().map(|&b| block::metatile(b)).find(|&id| id >= first && game.locate(map.pair, id).is_some())?;
+            (game.free_tiles(map.pair) >= 8).then_some((map.pair, id))
+        });
+        let (pair, id) = shown.unwrap_or_else(|| panic!("{path}: no map shows a secondary tileset's metatile"));
+        let tiles = game.tileset_tile_count(pair, true);
+
+        // a diagonal across its bottom layer, in colours it doesn't have there
+        let other_color = |now: u8| if now == 5 { 6 } else { 5 };
+        let now = game.layer_pixels(pair, id, 0);
+        let diagonal: Vec<(usize, usize, u8)> = (0..16).map(|i| (i, i, other_color(now[i * 17].0))).collect();
+        assert_eq!(game.draw_on_metatile(pair, id, 0, &diagonal, true), Ok(true), "{path}: metatile 0x{id:03X}");
+        assert!(game.commit());
+        let drawn = game.layer_pixels(pair, id, 0);
+        assert!(diagonal.iter().all(|&(x, y, color)| drawn[y * 16 + x].0 == color), "{path}");
+        // it alone changed, whatever tiles it shared: they were copied for it, four at most
+        assert_eq!(metatiles_apart(&game, &untouched, pair), [id as usize], "{path}: metatile 0x{id:03X}");
+        let added = game.tileset_tile_count(pair, true) - tiles;
+        assert!(added <= 4, "{path}: {added} tiles added");
+        // and the other pairs of that primary tileset look as they did
+        let other = game.pairs().into_iter().find(|p| p.primary == pair.primary && p.secondary != pair.secondary).unwrap();
+        assert!(metatiles_apart(&game, &untouched, other).is_empty(), "{path}");
+
+        // the edits carry it to another copy of the ROM
+        let edits = game.collect_edits();
+        assert_eq!((edits.maps.len(), edits.tilesets.len()), (0, 1), "{path}");
+        let mut copy = Game::open(bytes.clone(), &path, Profile::default()).unwrap();
+        let applied = copy.apply_edits(&Edits::from_json(&edits.to_json()).unwrap());
+        assert!(applied.skipped.is_empty(), "{path}: {:?}", applied.skipped);
+        copy.commit();
+        assert!(copy.collect_edits() == edits && metatiles_apart(&copy, &game, pair).is_empty(), "{path}");
+
+        // a primary tileset's metatile that shares a tile isn't drawn on for itself; the
+        // tile itself is, and every pair of that tileset shows it
+        let shares = |game: &Game, m: u16| game.tile_entries(pair, game.entries(pair, m)[0] & 0x3FF) > 1;
+        let primary = (0..first).find(|&m| shares(&game, m) && game.layer_pixels(pair, m, 0)[0].0 != 0).unwrap();
+        let color = other_color(game.layer_pixels(pair, primary, 0)[0].0);
+        assert_eq!(game.draw_on_metatile(pair, primary, 0, &[(0, 0, color)], true), Err(DrawError::Primary), "{path}");
+        assert!(!game.commit(), "{path}: nothing was done");
+        assert_eq!(game.draw_on_metatile(pair, primary, 0, &[(0, 0, color)], false), Ok(true), "{path}");
+        assert!(game.commit());
+        assert!(
+            metatiles_apart(&game, &untouched, other).contains(&(primary as usize)),
+            "{path}: a primary tileset's tile is every pair's"
+        );
+
+        while game.undo().is_some() {}
+        assert!(!game.modified(), "{path}: all undone");
+        println!("{path}: metatile 0x{id:03X} drawn on for itself ({added} tiles of its own), and a primary tileset's tile for every map");
+    }
+}
+
+#[test]
+fn maps_are_given_tilesets_of_their_own() {
+    for (path, bytes) in roms() {
+        let untouched = Game::open(bytes.clone(), &path, Profile::default()).unwrap();
+        let mut game = Game::open(bytes.clone(), &path, Profile::default()).unwrap();
+        // the first map's two tilesets, copied for it
+        let layout = game.maps[0].layout;
+        let pair = layout.pair();
+        let users = game.layout_users(layout.offset);
+        let secondary = game.duplicate_tileset(pair.secondary, false).unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert!(game.set_layout_tileset(layout.offset, false, secondary));
+        let primary = game.duplicate_tileset(pair.primary, true).unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert!(game.set_layout_tileset(layout.offset, true, primary) && game.commit());
+        let own = game.maps[0].layout.pair();
+        assert_eq!((own.primary, own.secondary, game.pairs().len()), (primary, secondary, untouched.pairs().len() + 1), "{path}");
+        // drawn with them, it looks as it did, metatile for metatile
+        assert!(game.render_sheet(own, 8) == untouched.render_sheet(pair, 8), "{path}: the copies' metatiles");
+        let look = |game: &Game, index: usize| game.render_map(&game.load_map(index).unwrap());
+        assert!(look(&game, 0) == look(&untouched, 0), "{path}");
+        // the ROM as it is now opens with them
+        let saved =
+            Game::open(game.rom.bytes().to_vec(), &path, Profile::default()).unwrap_or_else(|e| panic!("{path}, with the copies: {e}"));
+        assert_eq!((saved.maps.len(), saved.maps[0].layout.pair()), (game.maps.len(), own), "{path}");
+        assert!(look(&saved, 0) == look(&untouched, 0));
+
+        // a tile of the primary copy drawn on: the maps of that layout change, no other map of the tileset it's the copy of
+        let drawn = (0..16).map(|i| (i, i, 5)).chain((0..16).map(|i| (i, 15 - i, 6))).collect::<Vec<_>>();
+        let on = block::metatile(game.load_map(0).unwrap().blocks[0]);
+        assert_eq!(game.draw_on_metatile(own, on, 0, &drawn, false), Ok(true), "{path}");
+        assert!(game.commit());
+        let other = (0..game.maps.len()).find(|i| !users.contains(i) && game.maps[*i].layout.pair().primary == pair.primary).unwrap();
+        assert!(look(&game, 0) != look(&untouched, 0) && look(&game, other) == look(&untouched, other), "{path}");
+
+        // the edits tell the map its tilesets and the tilesets whole, and give them to another copy of the ROM
+        let edits = game.collect_edits();
+        assert_eq!(
+            (edits.maps.len(), edits.tilesets.len(), edits.tilesets.values().filter(|t| t.new.is_some()).count()),
+            (1, 2, 2),
+            "{path}"
+        );
+        let mut copy = Game::open(bytes, &path, Profile::default()).unwrap();
+        let applied = copy.apply_edits(&Edits::from_json(&edits.to_json()).unwrap());
+        assert!(applied.skipped.is_empty(), "{path}: {:?}", applied.skipped);
+        copy.commit();
+        assert!(look(&copy, 0) == look(&game, 0) && look(&copy, other) == look(&untouched, other), "{path}");
+        assert!(copy.render_sheet(copy.maps[0].layout.pair(), 8) == game.render_sheet(own, 8), "{path}");
+
+        while game.undo().is_some() {}
+        assert!(!game.modified() && game.maps[0].layout.pair() == pair, "{path}: all undone");
+        println!("{path}: {} given its own copies of its two tilesets ({} maps are drawn from its layout)", game.maps[0].name, users.len());
+    }
+}
+
+#[test]
+fn metatiles_change_places_and_no_map_looks_different() {
+    for (path, bytes) in roms() {
+        let untouched = Game::open(bytes.clone(), &path, Profile::default()).unwrap();
+        let mut game = Game::open(bytes.clone(), &path, Profile::default()).unwrap();
+        let map = game.load_map(0).unwrap();
+        let (pair, first) = (map.pair, game.format.primary_metatiles as u16);
+        // the first map's two most common metatiles of the primary tileset, and two of the secondary's
+        let mut uses: BTreeMap<u16, usize> = BTreeMap::new();
+        map.blocks.iter().for_each(|&b| *uses.entry(block::metatile(b)).or_default() += 1);
+        let mut most: Vec<(usize, u16)> = uses.into_iter().map(|(id, n)| (n, id)).collect();
+        most.sort_unstable_by(|a, b| b.cmp(a));
+        let of = |primary: bool| most.iter().map(|&(_, id)| id).filter(|&id| (id < first) == primary).take(2).collect::<Vec<u16>>();
+        let mut moved = Vec::new();
+        let mut renumbered = 0;
+        for ids in [of(true), of(false)] {
+            if let [a, b] = ids[..] {
+                renumbered += game.swap_metatiles(pair, a, b).unwrap_or_else(|e| panic!("{path}: 0x{a:03X} and 0x{b:03X}: {e}"));
+                moved.extend([a as usize, b as usize]);
+            }
+        }
+        assert!(game.commit() && moved.len() >= 2 && renumbered > 0, "{path}");
+        moved.sort_unstable();
+        // the metatiles changed places in the picker, and nothing else in it changed
+        let apart = metatiles_apart(&game, &untouched, pair);
+        assert!(!apart.is_empty() && apart.iter().all(|id| moved.contains(id)), "{path}: {apart:?} differ, {moved:?} moved");
+        // no map looks different: one map in twenty, and the first
+        let look = |game: &Game, index: usize| game.render_map(&game.load_map(index).unwrap());
+        let sample: Vec<usize> = (0..game.maps.len()).step_by(20).collect();
+        for &index in &sample {
+            assert!(look(&game, index) == look(&untouched, index), "{path}: {}", game.maps[index].name);
+        }
+        // the edits carry it to another copy of the ROM
+        let edits = game.collect_edits();
+        let mut copy = Game::open(bytes, &path, Profile::default()).unwrap();
+        let applied = copy.apply_edits(&Edits::from_json(&edits.to_json()).unwrap());
+        assert!(applied.skipped.is_empty(), "{path}: {:?}", applied.skipped);
+        copy.commit();
+        assert!(
+            sample.iter().all(|&index| look(&copy, index) == look(&untouched, index)) && metatiles_apart(&copy, &game, pair).is_empty(),
+            "{path}"
+        );
+        assert!(game.undo().is_some() && !game.modified(), "{path}: undone in one step");
+        println!("{path}: {} metatiles changed places, {renumbered} tiles renumbered on {} maps", moved.len(), edits.maps.len());
     }
 }

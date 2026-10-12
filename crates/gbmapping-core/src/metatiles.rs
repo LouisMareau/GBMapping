@@ -6,10 +6,11 @@
 //! there; once there, they grow where they are. The game itself never counts them: a
 //! map's block picks a metatile by its number, whatever it is.
 
-use crate::format::{ENTRIES, METATILE_BYTES};
+use crate::format::{block, ENTRIES, METATILE_BYTES};
 use crate::game::Game;
 use crate::rom::GBA_ROM_BASE;
 use crate::structs::{Pair, Tileset};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// Why a tileset wasn't given more metatiles
@@ -38,7 +39,86 @@ impl fmt::Display for GrowError {
     }
 }
 
+/// Why two metatiles didn't change places
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveError {
+    /// No such metatile
+    Nothing,
+    /// They aren't of the same tileset
+    Apart,
+}
+
+impl fmt::Display for MoveError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Nothing => write!(f, "There's no metatile there to change places with."),
+            Self::Apart => {
+                write!(f, "A metatile moves within its own tileset: the primary one's are every map's, the secondary one's its own maps'.")
+            }
+        }
+    }
+}
+
 impl Game {
+    /// Exchanges two metatiles of one of a pair's tilesets: what they're made of, their
+    /// attributes. Every map drawn with that tileset is renumbered to match (the maps'
+    /// originals too), so that no map looks or plays differently. Returns how many of
+    /// the maps' tiles were renumbered; to be committed.
+    ///
+    /// What names a metatile by its number elsewhere isn't known, and isn't changed: a
+    /// script that places one, the game's code for the doors it opens.
+    pub fn swap_metatiles(&mut self, pair: Pair, a: u16, b: u16) -> Result<usize, MoveError> {
+        let ((t, at), (other, to)) = (self.locate(pair, a).ok_or(MoveError::Nothing)?, self.locate(pair, b).ok_or(MoveError::Nothing)?);
+        if t.offset != other.offset {
+            return Err(MoveError::Apart);
+        }
+        if at == to {
+            return Ok(0);
+        }
+        let (entries, attributes) = (
+            [self.tileset_entries(&t, at), self.tileset_entries(&t, to)],
+            [self.tileset_attribute(&t, at), self.tileset_attribute(&t, to)],
+        );
+        self.set_tileset_entries(&t, at, &entries[1]);
+        self.set_tileset_entries(&t, to, &entries[0]);
+        self.set_tileset_attribute(&t, at, attributes[1]);
+        self.set_tileset_attribute(&t, to, attributes[0]);
+
+        // the tilesets made of those same metatiles (a Game Boy Color tileset is one per
+        // set of colours), and the layouts drawn with one: as a primary tileset its
+        // metatiles are numbered from 0, as a secondary one after the primary's
+        let known = self.tilesets().into_iter().chain(self.original_tilesets());
+        let same: BTreeSet<usize> = known.filter(|(known, _)| known.metatiles == t.metatiles).map(|(known, _)| known.offset).collect();
+        let first = self.format.primary_metatiles;
+        let mut places: BTreeMap<usize, (usize, Vec<(u16, u16)>)> = BTreeMap::new();
+        for l in self.maps.iter().flat_map(|m| [Some(m.layout), m.original]).flatten() {
+            let mut numbers = Vec::new();
+            if same.contains(&l.primary) && at.max(to) < first {
+                numbers.push((at as u16, to as u16));
+            }
+            if same.contains(&l.secondary) && self.format.secondary_metatiles() > 0 {
+                numbers.push(((first + at) as u16, (first + to) as u16));
+            }
+            if !numbers.is_empty() {
+                // blocks several layouts are drawn from are renumbered once
+                places.entry(l.blocks).or_insert((l.width * l.height, numbers.clone()));
+                places.entry(l.border).or_insert((l.border_width * l.border_height, numbers));
+            }
+        }
+        let mut renumbered = 0;
+        for (place, (count, numbers)) in places {
+            for i in 0..count {
+                let tile = self.rom.u16(place + i * 2);
+                let id = block::metatile(tile);
+                if let Some(&(x, y)) = numbers.iter().find(|&&(x, y)| id == x || id == y) {
+                    self.rom.write16(place + i * 2, block::with_metatile(tile, if id == x { y } else { x }));
+                    renumbered += 1;
+                }
+            }
+        }
+        Ok(renumbered)
+    }
+
     /// Gives a tileset more metatiles: `count` in all, the new ones empty (no tile, no
     /// behavior). `primary`: whether it's a primary tileset, which tells how many it may
     /// hold. Returns the tileset as it is then; to be committed.

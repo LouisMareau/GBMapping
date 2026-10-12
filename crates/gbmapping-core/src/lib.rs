@@ -10,12 +10,14 @@ pub mod gbc;
 pub mod gfx;
 pub mod map_names;
 pub mod metatiles;
+pub mod pixels;
 pub mod profile;
 pub mod rom;
 pub mod scan;
 pub mod structs;
 pub mod text;
 pub mod tiles;
+pub mod tilesets;
 
 pub use edits::Edits;
 pub use format::{block, Family, Format};

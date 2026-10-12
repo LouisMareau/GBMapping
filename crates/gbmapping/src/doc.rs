@@ -201,6 +201,14 @@ pub struct Doc {
     /// The tilesets the tileset tab lists (for a pair, with or without the others), and their tiles as drawn
     tile_sections: Option<TileSections>,
     tile_sheets: HashMap<(Pair, bool, Option<u8>), Rc<TilesTexture>>,
+    /// The Draw tab's layer, pen and colour
+    pub draw: crate::draw::Draw,
+    /// The picker moves metatiles: one dragged onto another changes places with it
+    pub moving: bool,
+    /// Where the metatile being dragged would go
+    pub move_to: Option<(usize, usize)>,
+    /// How many quarters of metatiles draw a tile, as last counted
+    tile_users: Option<((Pair, u16), usize)>,
 }
 
 /// A tileset's tiles as the tileset tab draws them
@@ -270,6 +278,10 @@ impl Doc {
             metatile_uses: None,
             tile_sections: None,
             tile_sheets: HashMap::new(),
+            draw: crate::draw::Draw::default(),
+            moving: false,
+            move_to: None,
+            tile_users: None,
         };
         doc.open_map(0);
         // a game painted by blocks begins with a whole block in hand
@@ -343,6 +355,117 @@ impl Doc {
         self.tile_usage = None;
         self.tile_sections = None;
         self.tile_sheets.clear();
+        self.tile_users = None;
+    }
+
+    /// Makes two of the picker's metatiles (whole blocks, in a game of blocks) change
+    /// places, `from` and `to` being where they are in the picker. The maps drawn with
+    /// their tileset are renumbered to match: nothing on them looks different.
+    pub fn move_metatile(&mut self, from: (usize, usize), to: (usize, usize)) {
+        self.end_stroke();
+        let Some(pair) = self.map.as_ref().map(|m| m.pair) else { return };
+        let ((from, _), (to, _)) = (self.whole(from, from), self.whole(to, to));
+        if from == to {
+            return;
+        }
+        let g = self.grain();
+        let id = |unit: (usize, usize), i: usize| ((unit.1 + i / g) * PICKER_COLUMNS + unit.0 + i % g) as u16;
+        // all of the two, or nothing
+        let there = |game: &Game, unit: (usize, usize)| (0..g * g).all(|i| game.locate(pair, id(unit, i)).is_some());
+        if !there(&self.game, from) || !there(&self.game, to) {
+            self.notice = Some("There's no metatile there to change places with".to_string());
+            return;
+        }
+        let mut renumbered = 0;
+        for i in 0..g * g {
+            match self.game.swap_metatiles(pair, id(from, i), id(to, i)) {
+                Ok(tiles) => renumbered += tiles,
+                Err(e) => {
+                    self.notice = Some(e.to_string());
+                    return;
+                }
+            }
+        }
+        if !self.game.commit() {
+            return;
+        }
+        self.reload();
+        self.pick_metatiles(to, to);
+        // a block goes by its own number, not by its quarters'
+        let number = |unit: (usize, usize)| if g > 1 { gbmapping_core::gbc::block_of(id(unit, 0)).0 } else { id(unit, 0) as usize };
+        let what = if g > 1 { "Blocks" } else { "Metatiles" };
+        self.notice = Some(format!(
+            "{what} 0x{:03X} and 0x{:03X} changed places, and {renumbered} tiles of the maps were renumbered to match: no map looks different. What names one by its number elsewhere (a script that places it, the game's doors) isn't changed.",
+            number(from),
+            number(to)
+        ));
+    }
+
+    /// What to call a tileset: where it is, and the maps drawn with it
+    pub fn tileset_label(&self, offset: usize) -> String {
+        let mut users = self.game.maps.iter().filter(|m| m.layout.primary == offset || m.layout.secondary == offset);
+        let first = users.next().map_or("no map", |m| m.name.as_str());
+        let new = if self.game.is_new_tileset(offset) { "new · " } else { "" };
+        match users.count() {
+            0 => format!("{new}0x{offset:06X} · {first}"),
+            more => format!("{new}0x{offset:06X} · {first} + {more} maps"),
+        }
+    }
+
+    /// The tilesets a map can be given as its primary or its secondary one: those the maps are drawn with
+    pub fn tileset_choices(&self, primary: bool) -> Vec<usize> {
+        self.game.tilesets().into_iter().filter(|&(_, as_primary)| as_primary == primary).map(|(t, _)| t.offset).collect()
+    }
+
+    /// Gives the map on screen another tileset, primary or secondary: one of the ROM's, a
+    /// copy of the one it has (`None`), or a new, empty secondary one (`empty`). It's the
+    /// map's layout that's given it: every map drawn from that layout changes with it.
+    pub fn give_tileset(&mut self, primary: bool, tileset: Option<usize>, empty: bool) {
+        self.end_stroke();
+        let Some((layout, pair)) = self.map.as_ref().map(|m| (m.layout.offset, m.pair)) else { return };
+        let had = if primary { pair.primary } else { pair.secondary };
+        let which = if primary { "primary" } else { "secondary" };
+        let made = match (tileset, empty) {
+            (Some(tileset), _) => Ok(tileset),
+            (None, true) => self.game.empty_tileset(had),
+            (None, false) => self.game.duplicate_tileset(had, primary),
+        };
+        let given = match made {
+            Ok(given) if self.game.set_layout_tileset(layout, primary, given) => given,
+            Ok(given) => {
+                self.notice = Some(format!("There's no tileset at 0x{given:06X}"));
+                return;
+            }
+            Err(e) => {
+                self.notice = Some(e.to_string());
+                return;
+            }
+        };
+        self.game.commit();
+        self.reload();
+        let maps = match self.game.layout_users(layout).len() {
+            1 => "This map".to_string(),
+            n => format!("The {n} maps drawn from this layout"),
+        };
+        self.notice = Some(match (tileset, empty) {
+            (Some(_), _) => format!("{maps}: {which} tileset 0x{given:06X} from now on"),
+            (None, true) => format!(
+                "{maps}: a new, empty secondary tileset (0x{given:06X}). What was drawn with the old one shows nothing until it's redrawn; the old one's tiles are under \"All tilesets\"."
+            ),
+            (None, false) => format!("{maps}: a copy of the {which} tileset, its own (0x{given:06X}). What's changed in it changes no other map."),
+        });
+    }
+
+    /// How many quarters of metatiles draw a tile of a pair: drawing on it changes them all
+    pub fn tile_users(&mut self, pair: Pair, tile: u16) -> usize {
+        match self.tile_users {
+            Some((counted, users)) if counted == (pair, tile) => users,
+            _ => {
+                let users = self.game.tile_entries(pair, tile);
+                self.tile_users = Some(((pair, tile), users));
+                users
+            }
+        }
     }
 
     /// A tileset was written to (its metatiles, its tiles, its palettes)

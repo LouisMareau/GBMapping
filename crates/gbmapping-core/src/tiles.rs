@@ -14,7 +14,10 @@ use crate::structs::{Pair, Tileset};
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
-const TILE_BYTES: usize = 32;
+pub(crate) const TILE_BYTES: usize = 32;
+/// The tiles the games draw their opening doors into: the last ones a secondary
+/// tileset may hold. A tile put there would be drawn over each time a door opens.
+pub const DOOR_TILES: usize = 16;
 
 /// How often the metatiles draw each tile of each tileset in each palette
 #[derive(Clone, Debug, Default)]
@@ -95,7 +98,7 @@ impl fmt::Display for BorrowError {
         match self {
             Self::Nothing => write!(f, "There's no such tile."),
             Self::Full { tiles } => {
-                write!(f, "The map's secondary tileset is full: it holds {tiles} tiles, as many as a secondary tileset can.")
+                write!(f, "The map's secondary tileset has no tile left to give: it holds {tiles}, every one drawn by a metatile (the game keeps a tileset's last {DOOR_TILES} for the doors it opens).")
             }
             Self::NotCompressed => {
                 write!(f, "The map's secondary tileset keeps its tiles uncompressed: where they end can't be told, so none can be added.")
@@ -227,6 +230,43 @@ impl Game {
                 (p.primary == tileset).then_some((p, false))
             }
         })
+    }
+
+    /// The tiles of a pair's secondary tileset that no metatile draws, the empty ones
+    /// first: tiles to give away when the tileset has no room for more. `data`: its tiles.
+    pub(crate) fn idle_tiles(&self, pair: Pair, data: &[u8]) -> Vec<usize> {
+        let (first, count) = (self.format.primary_tiles, (data.len() / TILE_BYTES).min(self.tile_room()));
+        let mut drawn = vec![false; count];
+        // its own metatiles draw its tiles; the primary tileset's shouldn't, but are looked at
+        for (offset, primary) in [(pair.secondary, false), (pair.primary, true)] {
+            let Some(t) = self.tileset(offset) else { continue };
+            for local in 0..self.tileset_metatiles(&t, primary) {
+                for e in self.tileset_entries(&t, local) {
+                    if let Some(tile) = ((e & 0x3FF) as usize).checked_sub(first).filter(|&tile| tile < count) {
+                        drawn[tile] = true;
+                    }
+                }
+            }
+        }
+        let empty = |tile: usize| data[tile * TILE_BYTES..(tile + 1) * TILE_BYTES].iter().all(|&b| b == 0);
+        let mut idle: Vec<usize> = (0..count).filter(|&tile| !drawn[tile]).collect();
+        idle.sort_by_key(|&tile| !empty(tile));
+        idle
+    }
+
+    /// How many tiles a secondary tileset may hold: its share, less the doors'
+    pub(crate) fn tile_room(&self) -> usize {
+        self.format.secondary_tiles().saturating_sub(DOOR_TILES)
+    }
+
+    /// Where a pair's secondary tileset takes a new tile: after its last one while it
+    /// has room, else in place of one no metatile draws. `None`: every tile is drawn.
+    pub(crate) fn tile_slot(&self, pair: Pair, data: &[u8]) -> Option<usize> {
+        let count = data.len() / TILE_BYTES;
+        if count < self.tile_room() {
+            return Some(count);
+        }
+        self.idle_tiles(pair, data).first().copied()
     }
 
     /// The pair's 16 palettes as the ROM has them (15-bit colours)
@@ -401,14 +441,13 @@ impl Game {
             Some(tile) => tile,
             None => {
                 let count = second.len() / TILE_BYTES;
-                if count >= f.secondary_tiles() {
-                    return Err(BorrowError::Full { tiles: count });
-                }
+                let slot = self.tile_slot(pair, &second).ok_or(BorrowError::Full { tiles: count })?;
                 let mut data = second[..count * TILE_BYTES].to_vec();
-                data.extend_from_slice(&packed);
+                data.resize(data.len().max((slot + 1) * TILE_BYTES), 0);
+                data[slot * TILE_BYTES..(slot + 1) * TILE_BYTES].copy_from_slice(&packed);
                 let placement = self.place_tiles(&secondary, &data)?;
                 self.write_tiles(&secondary, &placement);
-                f.primary_tiles + count
+                f.primary_tiles + slot
             }
         };
         if kind == Colors::Added {

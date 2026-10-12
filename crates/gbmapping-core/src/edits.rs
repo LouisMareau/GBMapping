@@ -16,6 +16,8 @@
 use crate::format::ENTRIES;
 use crate::game::{attribute_in, entries_in, Game, MapId};
 use crate::structs::Tileset;
+use crate::tiles::TileUsage;
+use crate::tilesets::TilesetContent;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,6 +34,10 @@ pub struct Edits {
     pub maps: BTreeMap<String, MapEdit>,
     #[serde(default)]
     pub tilesets: BTreeMap<String, TilesetEdit>,
+    /// The maps' originals (the layouts a profile tells the ROM keeps them in) that were
+    /// renumbered: metatiles that changed places are followed there too
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub originals: BTreeMap<String, MapEdit>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
@@ -41,6 +47,11 @@ pub struct MapEdit {
     pub blocks: Vec<u16>,
     #[serde(default)]
     pub border: Vec<u16>,
+    /// The tilesets the map was given, when they aren't the ones it had
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
@@ -57,11 +68,23 @@ pub struct TilesetEdit {
     /// Palette index in the tileset -> its 16 colours (15 bits each)
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub palettes: BTreeMap<String, Vec<u16>>,
+    /// A tileset the ROM didn't have: everything above is then all of it, not what changed
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new: Option<NewTileset>,
+}
+
+/// A tileset made in the editor
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewTileset {
+    pub secondary: bool,
+    /// The tileset it was made as a copy of: its tiles are animated the same
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_of: Option<String>,
 }
 
 impl TilesetEdit {
     pub fn is_empty(&self) -> bool {
-        self.metatiles.is_empty() && self.attributes.is_empty() && self.tiles.is_empty() && self.palettes.is_empty()
+        self.metatiles.is_empty() && self.attributes.is_empty() && self.tiles.is_empty() && self.palettes.is_empty() && self.new.is_none()
     }
 }
 
@@ -86,7 +109,7 @@ pub struct Applied {
 
 impl Edits {
     pub fn is_empty(&self) -> bool {
-        self.maps.is_empty() && self.tilesets.is_empty()
+        self.maps.is_empty() && self.tilesets.is_empty() && self.originals.is_empty()
     }
 
     /// How many maps and tilesets the file changes
@@ -140,10 +163,25 @@ impl Game {
                 continue;
             }
             if let Some(m) = self.load_map(index) {
-                edits.maps.insert(info.id.to_string(), MapEdit { width: m.width, height: m.height, blocks: m.blocks, border: m.border });
+                let given = self.layout_tilesets_changed(&info.layout);
+                let (primary, secondary) = (given.0.then(|| tileset_key(m.pair.primary)), given.1.then(|| tileset_key(m.pair.secondary)));
+                edits.maps.insert(
+                    info.id.to_string(),
+                    MapEdit { width: m.width, height: m.height, blocks: m.blocks, border: m.border, primary, secondary },
+                );
+            }
+        }
+        // the maps' originals aren't edited, but they're renumbered when metatiles change places
+        for (index, info) in self.maps.iter().enumerate() {
+            let Some(original) = info.original.filter(|l| self.layout_edited(l)) else { continue };
+            if let Some(m) = self.load_original(index).filter(|_| layouts.insert(original.offset)) {
+                let renumbered =
+                    MapEdit { width: m.width, height: m.height, blocks: m.blocks, border: m.border, primary: None, secondary: None };
+                edits.originals.insert(info.id.to_string(), renumbered);
             }
         }
         let mut seen = BTreeSet::new();
+        let usage = self.tile_usage();
         for (t, primary) in self.tilesets() {
             if !seen.insert(t.offset) {
                 continue;
@@ -152,6 +190,9 @@ impl Game {
             // the tileset as it was: its metatiles may have been moved since, and added to
             let before = self.original_tileset(t.offset);
             let had = before.map_or(0, |before| self.tileset_metatiles(&before, primary));
+            if before.is_none() {
+                edit.new = Some(NewTileset { secondary: !primary, copy_of: self.copied_from(t.offset).map(tileset_key) });
+            }
             for i in 0..self.tileset_metatiles(&t, primary) {
                 // a metatile the tileset didn't have is told whole
                 let then = before.filter(|_| i < had);
@@ -164,7 +205,7 @@ impl Game {
                     edit.attributes.insert(i.to_string(), attribute);
                 }
             }
-            self.collect_tiles(&t, primary, &mut edit);
+            self.collect_tiles(&t, primary, &usage, &mut edit);
             if !edit.is_empty() {
                 edits.tilesets.insert(tileset_key(t.offset), edit);
             }
@@ -176,6 +217,19 @@ impl Game {
     /// this ROM doesn't have are skipped and reported.
     pub fn apply_edits(&mut self, edits: &Edits) -> Applied {
         let mut applied = Applied::default();
+        // the tilesets the file makes come first: maps may be given them
+        let mut made: BTreeMap<&str, usize> = BTreeMap::new();
+        for (key, e) in &edits.tilesets {
+            let there = parse_address(key).is_some_and(|o| self.tileset(o).is_some());
+            let Some(new) = e.new.as_ref().filter(|_| !there) else { continue };
+            match self.make_tileset(e, new) {
+                Ok(at) => {
+                    made.insert(key, at);
+                    applied.tilesets += 1;
+                }
+                Err(problem) => applied.skipped.push(format!("tileset {key}: {problem}")),
+            }
+        }
         for (key, e) in &edits.maps {
             let index = key.parse::<MapId>().ok().and_then(|id| self.map_index(id));
             let Some(mut map) = index.and_then(|i| self.load_map(i)) else {
@@ -194,9 +248,34 @@ impl Game {
                 map.border.copy_from_slice(&e.border);
             }
             self.store_map(&map);
+            // the tilesets it was given: one the file made, or one of the ROM's
+            for (primary, tileset) in [(true, &e.primary), (false, &e.secondary)] {
+                let Some(tileset) = tileset else { continue };
+                let at = made.get(tileset.as_str()).copied().or_else(|| parse_address(tileset));
+                if !at.is_some_and(|at| self.set_layout_tileset(map.layout.offset, primary, at)) {
+                    applied.skipped.push(format!("map {key} ({}): its tileset {tileset} isn't in this ROM", map.name));
+                }
+            }
             applied.maps += 1;
         }
+        for (key, e) in &edits.originals {
+            let index = key.parse::<MapId>().ok().and_then(|id| self.map_index(id));
+            match index
+                .and_then(|i| self.load_original(i))
+                .filter(|m| (m.width, m.height, m.blocks.len(), m.border.len()) == (e.width, e.height, e.blocks.len(), e.border.len()))
+            {
+                Some(mut original) => {
+                    original.blocks.copy_from_slice(&e.blocks);
+                    original.border.copy_from_slice(&e.border);
+                    self.store_map(&original);
+                }
+                None => applied.skipped.push(format!("the original of map {key}: not in this ROM")),
+            }
+        }
         for (key, e) in &edits.tilesets {
+            if made.contains_key(key.as_str()) {
+                continue;
+            }
             let Some(t) = parse_address(key).and_then(|o| self.tileset(o)) else {
                 applied.skipped.push(format!("tileset {key}: not in this ROM"));
                 continue;
@@ -208,10 +287,68 @@ impl Game {
         applied
     }
 
+    /// Makes the tileset an edit tells whole: where it is in this ROM
+    fn make_tileset(&mut self, e: &TilesetEdit, new: &NewTileset) -> Result<usize, String> {
+        let numbered = |i: &String| i.parse::<usize>().ok();
+        let count = e.metatiles.keys().chain(e.attributes.keys()).filter_map(numbered).max().map_or(0, |last| last + 1);
+        let mut content = TilesetContent {
+            secondary: new.secondary,
+            callback: 0,
+            tiles: vec![0; e.tiles.keys().filter_map(numbered).max().map_or(0, |last| last + 1).min(1024) * 32],
+            palettes: vec![0; 256],
+            metatiles: vec![[0; ENTRIES]; count.min(1024)],
+            attributes: vec![0; count.min(1024)],
+        };
+        for (i, entries) in &e.metatiles {
+            if let (Some(place), Ok(entries)) =
+                (numbered(i).and_then(|i| content.metatiles.get_mut(i)), <[u16; ENTRIES]>::try_from(entries.as_slice()))
+            {
+                *place = entries;
+            }
+        }
+        for (i, &attribute) in &e.attributes {
+            if let Some(place) = numbered(i).and_then(|i| content.attributes.get_mut(i)) {
+                *place = attribute;
+            }
+        }
+        for (i, hex) in &e.tiles {
+            if let (Some(i), Some(tile)) = (numbered(i).filter(|&i| i < 1024), from_hex(hex).filter(|tile| tile.len() == 32)) {
+                content.tiles[i * 32..(i + 1) * 32].copy_from_slice(&tile);
+            }
+        }
+        for (p, colors) in &e.palettes {
+            if let Some(p) = numbered(p).filter(|&p| p < 16 && colors.len() == 16) {
+                content.palettes[p * 16..(p + 1) * 16].copy_from_slice(colors);
+            }
+        }
+        // its tiles are animated as those of the tileset it's the copy of, when this ROM has that one
+        let source = new.copy_of.as_deref().and_then(parse_address).filter(|&o| self.tileset(o).is_some());
+        content.callback = source.map_or(0, |o| self.rom.u32(o + self.format.tileset_callback));
+        let at = self.create_tileset(&content).map_err(|e| e.to_string())?;
+        if let Some(source) = source {
+            self.copies.insert(at, source);
+        }
+        Ok(at)
+    }
+
     /// A tileset's tiles and palettes that aren't what they were
-    fn collect_tiles(&self, t: &Tileset, primary: bool, edit: &mut TilesetEdit) {
-        let Some(before) = self.original_tileset(t.offset) else { return };
+    fn collect_tiles(&self, t: &Tileset, primary: bool, usage: &TileUsage, edit: &mut TilesetEdit) {
         let (now, then) = (self.rom.bytes(), self.original().bytes());
+        let colors = |bytes: &[u8]| bytes.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect::<Vec<u16>>();
+        // a tileset the ROM didn't have: every tile that isn't empty, every palette
+        let Some(before) = self.original_tileset(t.offset) else {
+            for (i, tile) in self.tiles(t.offset, primary).as_chunks::<32>().0.iter().enumerate() {
+                if tile.iter().any(|&b| b != 0) {
+                    edit.tiles.insert(i.to_string(), to_hex(tile));
+                }
+            }
+            for p in 0..16 {
+                if let Some(palette) = now.get(t.palettes + p * 32..t.palettes + p * 32 + 32) {
+                    edit.palettes.insert(p.to_string(), colors(palette));
+                }
+            }
+            return;
+        };
         // the tiles, unless they're the same bytes at the same place
         let packed = |rom: &crate::rom::Rom, at: usize| rom.lz77_len(at).and_then(|len| rom.bytes().get(at..at + len).map(<[u8]>::to_vec));
         if t.compressed && (t.tiles != before.tiles || packed(&self.rom, t.tiles) != packed(self.original(), before.tiles)) {
@@ -222,12 +359,21 @@ impl Game {
                     edit.tiles.insert(i.to_string(), to_hex(tile));
                 }
             }
+        } else if !t.compressed && !before.compressed {
+            // not compressed: the tiles are where they were, but how many they are can't be
+            // told. Only those a metatile draws are tiles for sure: what follows is something else.
+            let tiles = self.tiles(t.offset, primary);
+            for (i, tile) in tiles.as_chunks::<32>().0.iter().enumerate() {
+                if usage.uses(t.offset, i) > 0 && then.get(before.tiles + i * 32..before.tiles + i * 32 + 32) != Some(&tile[..]) {
+                    edit.tiles.insert(i.to_string(), to_hex(tile));
+                }
+            }
         }
         for p in 0..16 {
             let at = |palettes: usize| palettes + p * 32..palettes + p * 32 + 32;
-            if let (Some(colors), Some(old)) = (now.get(at(t.palettes)), then.get(at(before.palettes))) {
-                if colors != old {
-                    edit.palettes.insert(p.to_string(), colors.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect());
+            if let (Some(palette), Some(old)) = (now.get(at(t.palettes)), then.get(at(before.palettes))) {
+                if palette != old {
+                    edit.palettes.insert(p.to_string(), colors(palette));
                 }
             }
         }
@@ -250,7 +396,7 @@ impl Game {
                     _ => problems.push(format!("tile {i} isn't one")),
                 }
             }
-            if let Err(e) = self.store_tiles(t, &data) {
+            if let Err(e) = self.put_tiles(t, !t.secondary, &data) {
                 problems.push(format!("its tiles: {e}"));
             }
         }

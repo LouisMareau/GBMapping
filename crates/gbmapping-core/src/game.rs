@@ -235,6 +235,8 @@ pub struct Game {
     /// The Game Boy Color ROM this was read from, when it's one: `rom` is then what the
     /// editor made of it (see `gbc`), and saving writes the edits back into it
     gbc: Option<Box<Cartridge>>,
+    /// The tilesets made here as copies, and what each is the copy of
+    pub(crate) copies: HashMap<usize, usize>,
 }
 
 impl Game {
@@ -291,6 +293,7 @@ impl Game {
             undo: Vec::new(),
             redo: Vec::new(),
             gbc: None,
+            copies: HashMap::new(),
         };
         game.maps = game.list_maps();
         Ok(game)
@@ -319,6 +322,7 @@ impl Game {
             undo: Vec::new(),
             redo: Vec::new(),
             gbc: Some(Box::new(read.cartridge)),
+            copies: HashMap::new(),
         };
         game.maps = game.list_maps();
         Ok(game)
@@ -528,7 +532,24 @@ impl Game {
     /// Does a layout's data differ from the ROM as it was opened?
     pub fn layout_edited(&self, l: &Layout) -> bool {
         let differs = |at: usize, len: usize| self.rom.bytes().get(at..at + len) != self.original.bytes().get(at..at + len);
-        differs(l.blocks, l.width * l.height * 2) || differs(l.border, l.border_width * l.border_height * 2)
+        differs(l.blocks, l.width * l.height * 2)
+            || differs(l.border, l.border_width * l.border_height * 2)
+            || self.layout_tilesets_changed(l) != (false, false)
+    }
+
+    /// Was a layout given another primary tileset, another secondary one, since the ROM was opened?
+    pub fn layout_tilesets_changed(&self, l: &Layout) -> (bool, bool) {
+        let changed = |at: usize| self.rom.u32(l.offset + at) != self.original.u32(l.offset + at);
+        (changed(16), changed(20))
+    }
+
+    /// The maps' layouts again from the ROM: their tilesets may not be what they were
+    pub(crate) fn refresh_layouts(&mut self) {
+        let reader = self.reader();
+        let layouts: Vec<Option<Layout>> = self.maps.iter().map(|m| reader.layout(m.layout.offset)).collect();
+        for (map, layout) in self.maps.iter_mut().zip(layouts) {
+            map.layout = layout.unwrap_or(map.layout);
+        }
     }
 
     /// The layouts (their offsets) edited since the ROM was opened
@@ -736,6 +757,7 @@ impl Game {
         let patch = self.undo.pop()?;
         self.rom.revert(&patch);
         self.forget_tiles();
+        self.refresh_layouts();
         let at = patch.changes.first().map(|c| c.offset as usize);
         self.redo.push(patch);
         at
@@ -746,6 +768,7 @@ impl Game {
         let patch = self.redo.pop()?;
         self.rom.reapply(&patch);
         self.forget_tiles();
+        self.refresh_layouts();
         let at = patch.changes.first().map(|c| c.offset as usize);
         self.undo.push(patch);
         at

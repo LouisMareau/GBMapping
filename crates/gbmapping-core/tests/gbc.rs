@@ -7,6 +7,7 @@ use gbmapping_core::format::block;
 use gbmapping_core::gbc::{block_of, quarter};
 use gbmapping_core::gfx::color555;
 use gbmapping_core::metatiles::GrowError;
+use gbmapping_core::pixels::DrawError;
 use gbmapping_core::{Edits, Family, Game, OpenError, Profile};
 
 const BANK: usize = 0x4000;
@@ -355,5 +356,37 @@ fn not_these_games() {
     // and a tileset keeps the blocks it has
     let pair = game.maps[0].layout.pair();
     assert_eq!(game.add_metatile(pair, None), Err(GrowError::Blocks));
+    // nor are its tiles drawn on, or its colours changed: they aren't written back
+    assert_eq!(game.draw_on_metatile(pair, 0, 0, &[(0, 0, 1)], true), Err(DrawError::Fixed));
+    assert!(!game.set_color(pair, 0, 1, 0x7FFF));
+    // nor are whole tilesets made, or given to a map
+    assert_eq!(game.duplicate_tileset(pair.primary, true), Err(GrowError::Blocks));
+    assert!(!game.set_layout_tileset(game.maps[0].layout.offset, true, game.maps[1].layout.primary) && !game.commit());
     assert!(!game.commit());
+}
+
+#[test]
+fn blocks_change_places_and_the_maps_follow() {
+    let s = synth();
+    let mut game = open(&s);
+    let pair = game.maps[0].layout.pair();
+    let pictures: Vec<_> = (0..3).map(|i| game.render_map(&game.load_map(i).unwrap())).collect();
+    // a block is its four quarters: they change places one by one
+    let renumbered: usize = (0..4).map(|q| game.swap_metatiles(pair, quarter(1, q % 2, q / 2), quarter(3, q % 2, q / 2)).unwrap()).sum();
+    assert!(game.commit());
+    // the first map's blocks (which are the third's too) and its border: the others' aren't of that tileset, or have neither block
+    assert_eq!(renumbered, 8 + 4);
+    assert!((0..3).all(|i| game.render_map(&game.load_map(i).unwrap()) == pictures[i]), "no map looks different, whatever its colours");
+
+    // in the ROM: the two blocks' tiles and collisions, the maps' blocks, the border
+    let saved = game.saved();
+    assert_eq!((&saved[s.blocks..s.blocks + 4], saved[BANK + 0x20], saved[BANK + 0x38]), (&[3u8, 2, 1, 0][..], 3, 2));
+    let tiles = |block: usize| &saved[s.tileset_blocks + block * 16..s.tileset_blocks + block * 16 + 16];
+    assert_eq!((tiles(1), tiles(3)), (&[2u8; 16][..], &(1..=16).collect::<Vec<u8>>()[..]));
+    assert_eq!(saved[s.collisions + 4..s.collisions + 16], [0x71, 0x72, 0x7A, 0x7B, 0x12, 0x12, 0x12, 0x12, 0x07, 0x00, 0x18, 0x29]);
+    // and that ROM opens with maps that look the same
+    let again = Game::open(saved, "moved.gbc", Profile::default()).unwrap();
+    assert!((0..3).all(|i| again.render_map(&again.load_map(i).unwrap()) == pictures[i]));
+
+    assert!(game.undo().is_some() && game.saved() == s.bytes);
 }

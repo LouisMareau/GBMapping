@@ -44,8 +44,13 @@ const firstMap = [100, 83];
 const searchBox = [110, 49];
 const tilesetTab = [WIDTH - 292 + 101, 49];
 const metatilesTab = [WIDTH - 292 + 46, 49];
-/// The picker's metatile `id` (8 to a row, 32 pixels each)
-const metatile = (id) => [WIDTH - 292 + 9 + (id % 8) * 32 + 16, 160 + Math.floor(id / 8) * 32 + 16];
+/// The picker's metatile `id` (8 to a row, 32 pixels each), under the two rows of the
+/// map's tilesets (which a Game Boy Color map, of one tileset, doesn't have)
+const metatile = (id) => [WIDTH - 292 + 9 + (id % 8) * 32 + 16, (gameBoy ? 168 : 219) + Math.floor(id / 8) * 32 + 16];
+/// Over the picker: the tool that makes a metatile dragged onto another change places with it
+const moveTool = [WIDTH - 292 + 24, gameBoy ? 79 : 130];
+/// In those rows: the button that gives the map a copy of its secondary tileset
+const ownTileset = [WIDTH - 292 + 210, 100];
 /// The map's tile (x, y) at zoom 8, the map scrolled to its top left
 const tile = (x, y) => [242 + x * 16 * ZOOM + 8 * ZOOM, 46 + y * 16 * ZOOM + 8 * ZOOM];
 /// With the reference shown, the map and the reference share the middle of the page,
@@ -61,6 +66,14 @@ const tilesetPanel = {
   nextFree: [WIDTH - 292 + 154, 123],
   allTilesets: [WIDTH - 292 + 119, 343],
   list: [[WIDTH - 220, 500], [WIDTH - 100, 620], [WIDTH - 180, 740]],
+};
+/// The Draw tab: its tab, the eraser, the pixel (x, y) of the metatile drawn on, and the
+/// colour `i` of the palette under it
+const draw = {
+  tab: [WIDTH - 292 + 148, 49],
+  eraser: [WIDTH - 292 + 81, 154],
+  pixel: (x, y) => [WIDTH - 292 + 9 + x * 17 + 8, 187 + y * 17 + 8],
+  color: (i) => [WIDTH - 292 + 9 + i * 17 + 8, 495],
 };
 /// Where the two maps' top left corners are then
 const [mapCorner, referenceCorner] = [[242, 97], [682, 97]];
@@ -169,6 +182,18 @@ try {
     const saved = await download(toolbar.save);
     const changed = saved ? differing(saved, original) : -1;
     check('redone, the ROM saved differs by the block painted and the checksum', changed >= 1 && changed <= 3, `${changed} bytes`);
+    // two blocks change places: their tiles and collisions in the ROM, and the maps' blocks that are one or the other
+    await browser.click(...moveTool);
+    await browser.drag([metatile(18), metatile(0)]);
+    await browser.move(...tile(4, 3));
+    await shot('blocks-moved');
+    const moved = await download(toolbar.save);
+    const movedBytes = moved ? differing(moved, original) : -1;
+    check('a block dragged onto another changes places with it in the ROM', movedBytes > 8, `${movedBytes} bytes`);
+    await browser.key('z', { ctrl: true });
+    await browser.click(...moveTool);
+    const unmoved = await download(toolbar.save);
+    check('undone, the ROM is the one with the block painted', !!unmoved && !!saved && unmoved.equals(saved));
     await browser.click(...tilesetTab);
     await shot('tileset-tab');
     await browser.click(...metatilesTab);
@@ -271,6 +296,49 @@ try {
 
     // -- the tileset tab: a tile of another tileset goes into a metatile of this map's ----------------
     const edited = await download(toolbar.exportEdits);
+    // a tileset of the map's own: a copy of its secondary one. The edits tell it whole, and the map that it has it.
+    await browser.click(...ownTileset);
+    await shot('tileset-of-its-own');
+    const owned = await download(toolbar.exportEdits);
+    const withOwn = owned ? JSON.parse(owned.toString()) : {};
+    const made = Object.entries(withOwn.tilesets ?? {}).filter(([, tileset]) => tileset.new);
+    const given = Object.values(withOwn.maps ?? {}).filter((map) => map.secondary);
+    const allOfIt = made.length === 1 && made[0][1].new.secondary === true && Object.keys(made[0][1].palettes ?? {}).length === 16 && Object.keys(made[0][1].metatiles ?? {}).length >= 1;
+    check('Duplicate gives the map a copy of its secondary tileset, its own', allOfIt && given.length === 1 && given[0].secondary === made[0][0], allOfIt ? `${made[0][0]}, a copy of ${made[0][1].new.copy_of}: ${Object.keys(made[0][1].metatiles).length} metatiles, ${Object.keys(made[0][1].tiles ?? {}).length} tiles` : `${made.length} tileset(s) made, ${given.length} map(s) given one`);
+    await browser.key('z', { ctrl: true });
+    const disowned = await download(toolbar.exportEdits);
+    check('undone, the map has the tileset it had', !!disowned && !!edited && disowned.equals(edited));
+
+    // two metatiles change places in the picker: the maps are renumbered, and look as they did
+    const mapShown = async (name) => {
+      await browser.move(WIDTH / 2, HEIGHT - 8);
+      await browser.wait(500);
+      return decodePng(readFileSync(await browser.screenshot(join(out, `${String(++step).padStart(2, '0')}-${name}.png`))));
+    };
+    const [left, top, across, down] = [242, 46, 640, 760];
+    // (the picker back at its first metatiles: what was picked on the maps since has scrolled it)
+    await browser.move(...metatile(20));
+    await browser.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: metatile(20)[0], y: metatile(20)[1], deltaX: 0, deltaY: -100000 });
+    const beforeMove = await mapShown('before-the-move');
+    await browser.click(...moveTool);
+    await browser.drag([metatile(5), metatile(2)]);
+    const afterMove = await mapShown('metatiles-moved');
+    let [mapPixels, pickerPixels] = [0, 0];
+    for (let y = top; y < top + down; y++) {
+      for (let x = left; x < WIDTH - 12; x++) {
+        const o = (y * beforeMove.width + x) * beforeMove.channels;
+        const differs = [0, 1, 2].some((c) => beforeMove.data[o + c] !== afterMove.data[o + c]);
+        if (x < left + across) mapPixels += differs;
+        else if (x > WIDTH - 292 + 9) pickerPixels += differs;
+      }
+    }
+    const moved = await download(toolbar.exportEdits);
+    const movedIn = Object.values((moved ? JSON.parse(moved.toString()) : {}).tilesets ?? {}).reduce((n, tileset) => n + Object.keys(tileset.metatiles ?? {}).length, 0);
+    check('a metatile dragged onto another changes places with it, and the map looks as it did', mapPixels === 0 && pickerPixels > 0 && movedIn === 2, `${movedIn} metatiles told, ${pickerPixels} pixels of the picker changed, ${mapPixels} of the map`);
+    await browser.key('z', { ctrl: true });
+    await browser.click(...moveTool);
+    const unmoved = await download(toolbar.exportEdits);
+    check('undone, the metatiles are where they were', !!unmoved && !!edited && unmoved.equals(edited));
     await browser.click(...tile(1, 1), 'right');
     await browser.click(...tilesetTab);
     // a copy of the metatile in hand, new in the secondary tileset: the edits tell it whole, and no map changes
@@ -280,6 +348,26 @@ try {
     const copies = Object.values((copied ? JSON.parse(copied.toString()) : {}).tilesets ?? {});
     const whole = copies.length === 1 && Object.values(copies[0].metatiles ?? {}).length === 1 && Object.values(copies[0].attributes ?? {}).length === 1;
     check('Duplicate gives the secondary tileset a new metatile: the copy of the one in hand', whole && Object.values(copies[0].metatiles)[0].length === 8, whole ? `metatile ${Object.keys(copies[0].metatiles)[0]} of its tileset` : `${copies.length} tileset(s) changed`);
+    // drawn on, a pixel at a time: a line in one of its palette's colours, another erased.
+    // The quarters drawn on get tiles of their own, which the edits tell.
+    await browser.click(...draw.tab);
+    await browser.click(...draw.color(13));
+    await browser.drag([draw.pixel(1, 1), draw.pixel(6, 6)]);
+    await browser.click(...draw.eraser);
+    await browser.drag([draw.pixel(14, 1), draw.pixel(9, 6)]);
+    await browser.move(WIDTH / 2, HEIGHT / 2);
+    await shot('metatile-drawn-on');
+    const drawn = await download(toolbar.exportEdits);
+    const drawnOn = Object.values((drawn ? JSON.parse(drawn.toString()) : {}).tilesets ?? {});
+    const tiles = drawnOn.reduce((n, tileset) => n + Object.keys(tileset.tiles ?? {}).length, 0);
+    check('the pencil and the eraser draw on the copy: the edits tell its tiles', drawnOn.length === 1 && tiles >= 1 && tiles <= 2, `${tiles} tile(s) in ${drawnOn.length} tileset(s)`);
+    let erased = drawn;
+    for (let i = 0; i < 2 && !(erased && copied && erased.equals(copied)); i++) {
+      await browser.key('z', { ctrl: true });
+      erased = await download(toolbar.exportEdits);
+    }
+    check('the strokes undone, the edits are the copy alone', !!erased && !!copied && erased.equals(copied));
+    await browser.click(...tilesetTab);
     await browser.key('z', { ctrl: true });
     const uncopied = await download(toolbar.exportEdits);
     check('undone, the tileset has the metatiles it had', !!uncopied && !!edited && uncopied.equals(edited));

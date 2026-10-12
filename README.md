@@ -23,9 +23,8 @@ and a hack all open the same way.
 | Pokémon FireRed, LeafGreen | BPR*, BPG* | their own layout (640 primary metatiles, 32-bit attributes, sized borders), written from pokefirered and checked on made-up ROMs only; not yet tried on a real one |
 | Pokémon Crystal (Game Boy Color) | BYT* | [its blocks as four tiles each](#game-boy-color-games); checked on the French game. Gold and Silver are laid out much the same and not yet tried. A hack that stores its maps another way (Polished Crystal compresses them) isn't read. |
 
-Not there yet: drawing tiles and choosing colours (tiles are copied from one
-tileset to another, not drawn), map sizes, events and connections, metatiles
-of three layers, the first Game Boy's games.
+Not there yet: map sizes, events and connections, metatiles of three layers,
+the first Game Boy's games.
 
 ## Using it
 
@@ -136,12 +135,69 @@ A metatile is eight tiles, each drawn in one of the map's palettes. The
   a new one is the safe choice. The line over the buttons tells how many
   times the selected metatile is on the maps.
 
-The limits: a secondary tileset holds a fixed number of tiles (the status bar
-says when it's full); the tiles must be compressed in the ROM, as the games' are;
-a metatile of the primary tileset (below `0x200` in Emerald), which every map
-shares, only takes the primary tileset's tiles: the tab says so when one is
-selected, and dims the tiles it can't take. The secondary tileset's metatiles
-take any.
+The limits: a secondary tileset holds a fixed number of tiles, the last 16 of
+which the games keep for the doors they open. One with no room left gives the
+tiles no metatile draws, and the status bar says when there's none. The tiles
+must be compressed in the ROM, as the games' are, to be added to. A metatile
+of the primary tileset (below `0x200` in Emerald), which every map shares,
+only takes the primary tileset's tiles: the tab says so when one is selected,
+and dims the tiles it can't take. The secondary tileset's metatiles take any.
+
+### Drawing on a metatile
+
+The **Draw** tab shows the selected metatile's bottom or top layer, large: 16×16
+pixels to draw on.
+
+- **Pencil** draws in the selected colour, **Eraser** leaves nothing (the layer
+  under shows through, or what's behind the map), **Fill** recolours the
+  pixels that look like the one clicked and touch it. The right button takes
+  the colour under it. A stroke is one step to undo.
+- The **colours** are those of the game: each quarter of a layer (a tile) is
+  drawn in one of the tilesets' palettes, 15 colours and nothing. The palette
+  under the picture is that of the quarter the pointer is on; the number next
+  to it gives the quarter another palette. The colour button changes the
+  selected colour itself, for everything drawn in that palette.
+- **Only this metatile** (on by default): a metatile is made of tiles that
+  other metatiles use too, the same one often several times in itself. A
+  quarter that shares its tile gets a copy of it when it's first drawn on, new
+  in the map's secondary tileset, so nothing else changes. Off, the tiles
+  themselves are drawn on, and every metatile that has them shows it: that's
+  how to retouch a tile everywhere. A primary tileset's metatile can't have
+  tiles of its own: **Duplicate** it and draw on the copy.
+- **Show both** shows the other layer too: what's drawn on the bottom layer
+  may be under the top one.
+
+Start from **New** for an empty metatile, or from **Duplicate** for a copy of
+one that's close.
+
+### A map's tilesets, and where its metatiles are
+
+The **Metatiles** tab shows what a map is drawn with: the metatiles of its
+primary tileset, then those of its secondary one. The two are named over the
+picker, by where they are in the ROM and the maps that have them.
+
+- The **list** gives the map another of the ROM's tilesets.
+- **Duplicate** gives it a copy of the one it has, its own: its tiles, its
+  palettes, its metatiles, its animation. The map looks the same, and what's
+  then changed in the copy (a metatile rebuilt, a tile drawn on, a colour)
+  changes no other map. That's how to rework a tileset for one place when
+  thirty maps share it.
+- **New** (for the secondary tileset) gives it an empty one, with the palettes
+  of the one it had: what the map drew with the old one shows nothing until
+  it's redrawn. The old one's tiles are still at hand under **All tilesets**.
+
+A map has its tilesets from its layout: maps drawn from the same layout get
+them together, and the status bar says how many. A new tileset is written to
+free space at the end of the ROM; one step to undo.
+
+**Move**, over the picker, makes metatiles change places: drag one onto
+another, of the same tileset. Every map drawn with that tileset is renumbered
+to match (the maps' originals too), so no map looks or plays differently:
+it's for putting a tileset in order, the new metatiles next to what they go
+with. What names a metatile by its number elsewhere isn't known to the
+editor, and isn't changed: a script that places one, the game's code for the
+doors it opens. Metatiles made here are named by nothing yet; think twice
+before moving the game's own.
 
 ### Game Boy Color games
 
@@ -152,7 +208,7 @@ has blocks, and everything above works the same, with these differences:
 
 - **Blocks are painted whole.** The picker shows them four to a row; a click
   or a drag takes whole blocks, on the map too, and Fill replaces an area of
-  one block.
+  one block. **Move** makes two blocks change places, the maps following.
 - Maps have no collision or elevation of their own: a block's **collision**
   is in its tileset, one per quarter. The Tileset tab names them (`FLOOR`,
   `WALL`, `TALL_GRASS`, `DOOR`…) and sets them.
@@ -172,8 +228,8 @@ has blocks, and everything above works the same, with these differences:
   touched: saved without an edit, it's the file that was opened, byte for
   byte.
 
-Tile pictures and palettes aren't edited, and a tileset keeps the blocks it
-has.
+Tile pictures and palettes aren't edited, a tileset keeps the blocks it has,
+and a map the tileset it has.
 
 ### As an app
 
@@ -250,12 +306,21 @@ file gives the tileset the metatiles up to it. What rebuilds a game from its
 sources has to add them to the tileset's metatiles and attributes the same
 way.
 
-`tiles` and `palettes` are only there when tiles were brought from another
-tileset: a tile's 32 bytes (4 bits a pixel, as the ROM has them once
-unpacked) in hexadecimal, by its number in the tileset, and a palette's 16
-colours (15 bits each) by its number. What reads an edits file to rebuild a
-game from its sources has to write those too, or the metatiles point at
-tiles that aren't there.
+A map given another tileset says which: `"primary"` or `"secondary"`, the
+tileset's address. A tileset made in the editor has `"new": {"secondary":
+true, "copy_of": "0x3DFBB4"}` and is then told whole (every metatile, every
+tile that isn't empty, its 16 palettes), `copy_of` being the tileset it was
+made as a copy of, when it was. Applied, it's made anew wherever that ROM
+has room, and the maps that had it are given it there. `"originals"` holds,
+by map, the maps' originals that were renumbered because metatiles changed
+places.
+
+`tiles` and `palettes` are only there when tiles were drawn on or brought from
+another tileset, or a colour changed: a tile's 32 bytes (4 bits a pixel, as
+the ROM has them once unpacked) in hexadecimal, by its number in the
+tileset, and a palette's 16 colours (15 bits each) by its number. What reads
+an edits file to rebuild a game from its sources has to write those too, or
+the metatiles point at tiles that aren't there.
 
 ## Building
 
@@ -310,8 +375,10 @@ checks the built site in a headless Chrome, end to end: a ROM in through the
 file chooser, tiles painted with the mouse, undo, the saved ROM and the
 exported edits compared with what they should be, tiles taken back from the
 reference, a map's original shown on its own tilesets when the profile tells
-one, a tile of another tileset put in a metatile and undone, the edits kept
-across a reload, the app installable and working offline. Screenshots land in
+one, a tileset copied for a map, two metatiles made to change places, a
+metatile duplicated and drawn on, a tile of another tileset put in a
+metatile, each undone, the edits kept across a reload, the app installable
+and working offline. Screenshots land in
 `target/browser-check/`. A second ROM is opened as the reference of the first,
 with the first's map `map` on screen: Crystal next to the hack that has its
 maps, `JohtoNewBarkTown` for instance. A `.gbc` given first is checked on its

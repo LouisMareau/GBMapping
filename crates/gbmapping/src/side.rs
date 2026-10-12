@@ -13,7 +13,7 @@ use gbmapping_core::{Game, Pair};
 
 const ACCENT: Color32 = Color32::from_rgb(76, 175, 80);
 const GROUND: Color32 = Color32::from_gray(17);
-const WARNING: Color32 = Color32::from_rgb(255, 202, 40);
+pub const WARNING: Color32 = Color32::from_rgb(255, 202, 40);
 const WHOLE: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
 
 pub fn show(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings) {
@@ -22,16 +22,21 @@ pub fn show(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings) {
         ui.selectable_value(&mut settings.tab, Tab::Metatiles, "Metatiles").on_hover_text("Pick what to paint");
         ui.selectable_value(&mut settings.tab, Tab::Tileset, "Tileset")
             .on_hover_text("Edit the selected metatile: its tiles, its behavior");
+        // a game whose tiles' pictures aren't written back has nothing to draw on
+        if doc.grain() == 1 {
+            ui.selectable_value(&mut settings.tab, Tab::Draw, "Draw").on_hover_text("Draw on the selected metatile, a pixel at a time");
+        }
     });
     ui.separator();
     let Some(pair) = doc.map.as_ref().map(|m| m.pair) else { return };
     match settings.tab {
         Tab::Metatiles => picker(ui, doc, pair),
-        Tab::Tileset => tileset(ui, doc, settings, pair),
+        Tab::Draw if doc.grain() == 1 => crate::draw::show(ui, doc, settings, pair),
+        Tab::Tileset | Tab::Draw => tileset(ui, doc, settings, pair),
     }
 }
 
-const QUARTERS: [&str; 4] = ["top left", "top right", "bottom left", "bottom right"];
+pub const QUARTERS: [&str; 4] = ["top left", "top right", "bottom left", "bottom right"];
 
 /// "0x00D TALL_GRASS"; in a game of blocks, "block 0x1A, top left: TALL_GRASS"
 pub fn describe(game: &Game, pair: Pair, id: u16) -> String {
@@ -61,7 +66,61 @@ pub fn describe_tile(game: &Game, pair: Pair, b: u16) -> String {
     format!("metatile {what}  ·  {passable}  ·  elevation {}", block::elevation(b))
 }
 
+/// The map's two tilesets: which they are, and the ways to give it others. Returns
+/// whether it was given one (the map is then to be drawn anew).
+fn tilesets(ui: &mut Ui, doc: &mut Doc, pair: Pair) -> bool {
+    // what's asked: (the primary one?, a tileset of the ROM's or a copy of this one, a new one)
+    let mut asked: Option<(bool, Option<usize>, bool)> = None;
+    for (primary, name) in [(true, "Primary"), (false, "Secondary")] {
+        let current = if primary { pair.primary } else { pair.secondary };
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(name).small()).on_hover_text(
+                "A map is drawn with two tilesets: the primary one's metatiles come first, the secondary one's after.\nThey're its layout's: every map drawn from the same layout has the same.",
+            );
+            // the buttons at the right, and the list of tilesets in the room that's left
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !primary {
+                    let new = ui.small_button("New").on_hover_text(
+                        "Gives this map a new, empty secondary tileset, with the palettes of the one it has.
+What the map draws with the old one shows nothing until it's redrawn.",
+                    );
+                    if new.clicked() {
+                        asked = Some((primary, None, true));
+                    }
+                }
+                let copy = ui.small_button("Duplicate").on_hover_text(
+                    "Gives this map a copy of this tileset, its own: its tiles, its palettes, its metatiles.
+What's then changed in it changes no other map (but those drawn from the same layout).",
+                );
+                if copy.clicked() {
+                    asked = Some((primary, None, false));
+                }
+                let room = (ui.available_width() - 8.0).max(40.0);
+                egui::ComboBox::from_id_salt(name).selected_text(doc.tileset_label(current)).width(room).truncate().show_ui(ui, |ui| {
+                    for offset in doc.tileset_choices(primary) {
+                        if ui.selectable_label(offset == current, doc.tileset_label(offset)).clicked() && offset != current {
+                            asked = Some((primary, Some(offset), false));
+                        }
+                    }
+                });
+            });
+        });
+    }
+    if let Some((primary, tileset, empty)) = asked {
+        doc.give_tileset(primary, tileset, empty);
+    }
+    asked.is_some()
+}
+
 fn picker(ui: &mut Ui, doc: &mut Doc, pair: Pair) {
+    // a game of blocks has one tileset a map, which isn't the editor's to copy
+    if doc.grain() == 1 {
+        if tilesets(ui, doc, pair) {
+            ui.ctx().request_repaint();
+            return;
+        }
+        ui.separator();
+    }
     let ctx = ui.ctx().clone();
     let ppp = ui.pixels_per_point();
     let cell = METATILE as f32 * scale_for(2, ppp);
@@ -76,7 +135,12 @@ fn picker(ui: &mut Ui, doc: &mut Doc, pair: Pair) {
     } else {
         String::new()
     };
-    ui.label(egui::RichText::new(format!("{}{size}", describe(&doc.game, pair, shown))).small());
+    ui.horizontal(|ui| {
+        ui.toggle_value(&mut doc.moving, egui::RichText::new("Move").small()).on_hover_text(
+            "Drag a metatile onto another: they change places.\nEvery map drawn with their tileset is renumbered to match, so that nothing on a map looks different.",
+        );
+        ui.label(egui::RichText::new(format!("{}{size}", describe(&doc.game, pair, shown))).small());
+    });
 
     // the border: the tiles the game repeats around the map
     if let Some((bw, bh, border)) = doc.map.as_ref().map(|m| (m.border_width, m.border_height, m.border.clone())) {
@@ -118,14 +182,41 @@ fn picker(ui: &mut Ui, doc: &mut Doc, pair: Pair) {
 
         let (pointer, primary) = ui.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down()));
         match pointer {
+            // moving: the metatile pressed on is held, and goes where it's let go
+            Some(p) if response.is_pointer_button_down_on() && primary && doc.moving => {
+                let start = *doc.picker_drag.get_or_insert(cell_at(p));
+                doc.pick_metatiles(start, start);
+                doc.move_to = Some(cell_at(p));
+            }
             Some(p) if response.is_pointer_button_down_on() && primary => {
                 let at = cell_at(p);
                 let start = *doc.picker_drag.get_or_insert(at);
                 doc.pick_metatiles(start, at);
             }
-            _ => doc.picker_drag = None,
+            _ => {
+                if let (Some(from), Some(to)) = (doc.picker_drag.take(), doc.move_to.take()) {
+                    doc.move_metatile(from, to);
+                }
+            }
         }
         doc.picker_hover = response.hover_pos().map(cell_at).map(|c| (c.1 * PICKER_COLUMNS + c.0) as u16);
+        // where the metatile held would land: shown there, over the one it would change places with
+        if let (Some(from), Some(to)) = (doc.picker_drag, doc.move_to) {
+            let ((from, _), (to, _)) = (doc.whole(from, from), doc.whole(to, to));
+            let unit = Vec2::splat(cell * doc.grain() as f32);
+            let place = |at: (usize, usize)| Rect::from_min_size(origin + vec2(at.0 as f32, at.1 as f32) * cell, unit);
+            if from != to {
+                let picture = Rect::from_min_size(
+                    pos2(from.0 as f32 / PICKER_COLUMNS as f32, from.1 as f32 / rows.max(1) as f32),
+                    vec2(doc.grain() as f32 / PICKER_COLUMNS as f32, doc.grain() as f32 / rows.max(1) as f32),
+                );
+                painter.image(sheet_texture, place(to), picture, Color32::from_white_alpha(200));
+                painter.rect_stroke(place(to), 0.0, Stroke::new(2.0, WARNING), StrokeKind::Inside);
+            }
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if doc.moving && response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
 
         if let Some((x, y)) = doc.stamp.picker {
             let selected =
@@ -174,15 +265,7 @@ fn tileset(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings, pair: Pair) {
     let mut add: Option<Option<u16>> = None;
     if !blocks {
         ui.horizontal(|ui| {
-            let new = ui.small_button("New").on_hover_text(
-                "A new, empty metatile at the end of this map's secondary tileset: nothing in the game uses it yet.",
-            );
-            let duplicate = ui.small_button("Duplicate").on_hover_text(
-                "A copy of this metatile, as a new one of this map's secondary tileset.\nEdit the copy: the maps the original is on stay as they are.",
-            );
-            if new.clicked() || duplicate.clicked() {
-                add = Some(duplicate.clicked().then_some(id));
-            }
+            add = new_buttons(ui, id);
             let next = ui.small_button("Next free").on_hover_text(
                 "The next metatile of the secondary tileset that's on no map, to rebuild.\nA script may still put it on a map as the game runs: a new one is used by nothing.",
             );
@@ -416,20 +499,38 @@ fn tileset(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings, pair: Pair) {
     }
     // the new metatile, once this one is as it was left: a step of its own, and the one in hand
     if let Some(like) = add {
-        match doc.game.add_metatile(pair, like) {
-            Ok(new) => {
-                doc.game.commit();
-                doc.tileset_changed();
-                doc.select_metatile(new);
-                doc.notice = Some(match like {
-                    Some(original) => format!(
-                        "Metatile 0x{new:03X} is a copy of 0x{original:03X}, new in this map's secondary tileset: no map has it yet"
-                    ),
-                    None => format!("Metatile 0x{new:03X} is new in this map's secondary tileset: empty, and on no map yet"),
-                });
-            }
-            Err(e) => doc.notice = Some(e.to_string()),
+        add_metatile(doc, pair, like);
+    }
+}
+
+/// The buttons that make a metatile to work on without changing any map: what's asked
+/// for, a new one (`Some(None)`) or the copy of this one
+pub fn new_buttons(ui: &mut Ui, id: u16) -> Option<Option<u16>> {
+    let new = ui
+        .small_button("New")
+        .on_hover_text("A new, empty metatile at the end of this map's secondary tileset: nothing in the game uses it yet.");
+    let duplicate = ui.small_button("Duplicate").on_hover_text(
+        "A copy of this metatile, as a new one of this map's secondary tileset.\nEdit the copy: the maps the original is on stay as they are.",
+    );
+    (new.clicked() || duplicate.clicked()).then(|| duplicate.clicked().then_some(id))
+}
+
+/// Gives the map's secondary tileset a new metatile, empty or the copy of another, and
+/// takes it in hand: a step of its own
+pub fn add_metatile(doc: &mut Doc, pair: Pair, like: Option<u16>) {
+    match doc.game.add_metatile(pair, like) {
+        Ok(new) => {
+            doc.game.commit();
+            doc.tileset_changed();
+            doc.select_metatile(new);
+            doc.notice = Some(match like {
+                Some(original) => {
+                    format!("Metatile 0x{new:03X} is a copy of 0x{original:03X}, new in this map's secondary tileset: no map has it yet")
+                }
+                None => format!("Metatile 0x{new:03X} is new in this map's secondary tileset: empty, and on no map yet"),
+            });
         }
+        Err(e) => doc.notice = Some(e.to_string()),
     }
 }
 

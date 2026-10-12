@@ -3,7 +3,12 @@
 //! Readers never panic: a read outside the ROM gives 0, a pointer outside it
 //! gives `None`. A hack's data can be anything.
 
+use std::collections::hash_map::{Entry, HashMap};
+
 pub const GBA_ROM_BASE: u32 = 0x0800_0000;
+/// How long the list of what an edit wrote gets before it's gone through for bytes
+/// written more than once
+const JOURNAL: usize = 1 << 18;
 
 /// One byte changed by an edit
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,11 +43,13 @@ pub struct Rom {
     bytes: Vec<u8>,
     pub name: String,
     journal: Vec<Change>,
+    /// The journal's length at which it's next made shorter
+    tidy_at: usize,
 }
 
 impl Rom {
     pub fn new(bytes: Vec<u8>, name: impl Into<String>) -> Self {
-        Self { bytes, name: name.into(), journal: Vec::new() }
+        Self { bytes, name: name.into(), journal: Vec::new(), tidy_at: JOURNAL }
     }
 
     pub fn len(&self) -> usize {
@@ -115,8 +122,35 @@ impl Rom {
             if *b != v {
                 self.journal.push(Change { offset: o as u32, old: *b, new: v });
                 *b = v;
+                // a long edit that writes the same bytes again and again (a tileset's
+                // tiles, compressed anew at each pixel drawn) doesn't keep every time
+                if self.journal.len() >= self.tidy_at {
+                    self.tidy();
+                    self.tidy_at = (self.journal.len() * 2).max(JOURNAL);
+                }
             }
         }
+    }
+
+    /// A byte written several times since the last patch is told once: what it was
+    /// before the first, what it is after the last. One that's back to what it was isn't told.
+    fn tidy(&mut self) {
+        if self.journal.len() < 2 {
+            return;
+        }
+        let mut places: HashMap<u32, usize> = HashMap::with_capacity(self.journal.len());
+        let mut once: Vec<Change> = Vec::with_capacity(self.journal.len());
+        for change in self.journal.drain(..) {
+            match places.entry(change.offset) {
+                Entry::Occupied(place) => once[*place.get()].new = change.new,
+                Entry::Vacant(place) => {
+                    place.insert(once.len());
+                    once.push(change);
+                }
+            }
+        }
+        once.retain(|change| change.old != change.new);
+        self.journal = once;
     }
 
     pub fn write16(&mut self, o: usize, v: u16) {
@@ -133,6 +167,8 @@ impl Rom {
 
     /// Everything written since the last call, as one undoable patch
     pub fn take_patch(&mut self) -> Patch {
+        self.tidy();
+        self.tidy_at = JOURNAL;
         Patch { changes: std::mem::take(&mut self.journal) }
     }
 
@@ -282,6 +318,27 @@ pub fn lz77_compress(data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_byte_written_twice_is_told_once() {
+        let mut rom = Rom::new(vec![1, 2, 3, 4], "journal");
+        rom.write8(0, 9);
+        rom.write8(1, 8);
+        rom.write8(0, 7);
+        rom.write8(2, 5);
+        rom.write8(2, 3);
+        let patch = rom.take_patch();
+        assert_eq!(
+            patch.changes,
+            [Change { offset: 0, old: 1, new: 7 }, Change { offset: 1, old: 2, new: 8 }],
+            "the third is back to what it was"
+        );
+        rom.revert(&patch);
+        assert_eq!(rom.bytes(), [1, 2, 3, 4]);
+        rom.reapply(&patch);
+        assert_eq!(rom.bytes(), [7, 8, 3, 4]);
+        assert!(rom.take_patch().is_empty());
+    }
 
     #[test]
     fn readers_never_panic() {
