@@ -5,7 +5,9 @@
 //!     GBMAPPING_TEST_ROMS="emerald.gba;my-hack.gba|my-hack.json" cargo test -p gbmapping-core --test roms -- --nocapture
 
 use gbmapping_core::format::block;
-use gbmapping_core::{Edits, Game, MapId, Profile};
+use gbmapping_core::rom::lz77_compress;
+use gbmapping_core::tiles::{BorrowError, Colors};
+use gbmapping_core::{Edits, Game, MapId, Profile, Rom};
 use std::collections::BTreeSet;
 
 /// The ROMs named, each with its profile's text when it has one
@@ -146,10 +148,108 @@ fn the_maps_originals_come_with_their_own_tilesets() {
         }
         let edited = game.collect_edits();
         assert!(edited.is_empty(), "{path}: looking at the originals changes nothing");
+
+        // the tilesets kept for the originals are there to take tiles from: one of an
+        // original's goes into the pair its map is on now, and looks the same there
+        let kept = game.original_tilesets();
+        assert!(!kept.is_empty() && kept.iter().all(|(t, _)| game.pair_with(t.offset).is_some()), "{path}: the originals' tilesets");
+        let usage = game.tile_usage();
+        let first = game.format.primary_tiles;
+        let mut game = game;
+        let mut taken = 0;
+        for &index in &originals {
+            let (to, from) = (game.maps[index].layout.pair(), game.maps[index].original.unwrap().pair());
+            let used = (0..game.tileset_tile_count(from, true)).find_map(|t| Some((t, usage.usual(from.secondary, t)?)));
+            let Some((tile, palette)) = used.filter(|_| !now.contains(&from)) else { continue };
+            let (shape, colors) = (game.gfx(from).tile((first + tile) as u16), game.palettes(from)[palette as usize]);
+            let Ok(borrowed) = game.borrow_tile(to, from, true, tile, palette) else { continue };
+            let (there, palette_there) = (game.gfx(to).tile(borrowed.tile), game.palettes(to)[borrowed.palette as usize]);
+            for (a, b) in shape.iter().zip(&there) {
+                assert_eq!(*a == 0, *b == 0, "{path}: {}: what's see-through stays so", game.maps[index].name);
+                if borrowed.colors != Colors::Approximated && *a != 0 {
+                    assert_eq!(colors[*a as usize], palette_there[*b as usize], "{path}: {}", game.maps[index].name);
+                }
+            }
+            game.commit();
+            while game.undo().is_some() {}
+            assert!(!game.modified(), "{path}: undone");
+            taken += 1;
+            if taken == 20 {
+                break;
+            }
+        }
+        assert!(taken > 0, "{path}: no tile of an original's tileset could be brought to its map's");
         println!(
-            "{path}: {} maps come with their original, on {} tileset pairs ({own} of them no map is on now)",
+            "{path}: {} maps come with their original, on {} tileset pairs ({own} of them no map is on now); a tile of {taken} originals' tilesets brought to their maps'",
             originals.len(),
             pairs.len()
         );
+    }
+}
+
+#[test]
+fn tiles_are_packed_again_and_brought_from_one_tileset_to_another() {
+    for (path, bytes) in roms() {
+        let mut game = Game::open(bytes.clone(), &path, Profile::default()).unwrap();
+        // every tileset's tiles come back the same from being compressed again, in about the room they took
+        let (mut was, mut is) = (0, 0);
+        for (t, _) in game.tilesets().into_iter().filter(|(t, _)| t.compressed) {
+            let tiles = game.rom.lz77(t.tiles).unwrap_or_else(|| panic!("{path}: the tiles at 0x{:06X}", t.tiles));
+            let packed = lz77_compress(&tiles);
+            assert!(Rom::new(packed.clone(), "packed").lz77(0).as_ref() == Some(&tiles), "{path}: the tiles at 0x{:06X}", t.tiles);
+            was += game.rom.lz77_len(t.tiles).unwrap();
+            is += packed.len();
+        }
+        assert!(is * 10 <= was * 11, "{path}: {is} bytes compressed, {was} in the ROM");
+
+        // tiles of one secondary tileset, used in the pair of another with the same primary
+        let pairs: Vec<_> = game.pairs().into_iter().collect();
+        let to = pairs[0];
+        let from = *pairs.iter().find(|p| p.primary == to.primary && p.secondary != to.secondary).expect("two secondary tilesets");
+        let usage = game.tile_usage();
+        let first = game.format.primary_tiles;
+        let (had, mut brought, mut added, mut inexact) = (game.tileset_tile_count(to, true), 0, 0, 0);
+        for tile in 0..game.tileset_tile_count(from, true) {
+            let Some(palette) = usage.usual(from.secondary, tile) else { continue };
+            let (shape, colors) = (game.gfx(from).tile((first + tile) as u16), game.palettes(from)[palette as usize]);
+            let borrowed = match game.borrow_tile(to, from, true, tile, palette) {
+                Ok(borrowed) => borrowed,
+                Err(BorrowError::Full { .. }) => break,
+                Err(e) => panic!("{path}: tile {tile}: {e}"),
+            };
+            // it looks the same there: pixel for pixel when the colours could be had
+            let (there, palette_there) = (game.gfx(to).tile(borrowed.tile), game.palettes(to)[borrowed.palette as usize]);
+            for (a, b) in shape.iter().zip(&there) {
+                assert_eq!(*a == 0, *b == 0, "{path}: tile {tile}: what's see-through stays so");
+                if borrowed.colors != Colors::Approximated && *a != 0 {
+                    assert_eq!(colors[*a as usize], palette_there[*b as usize], "{path}: tile {tile}");
+                }
+            }
+            brought += 1;
+            added += !borrowed.existing as usize;
+            inexact += (borrowed.colors == Colors::Approximated) as usize;
+            if brought == 60 {
+                break;
+            }
+        }
+        assert!(brought > 0 && inexact == 0, "{path}: {brought} tiles brought, {inexact} in approximate colours");
+        assert_eq!(game.tileset_tile_count(to, true), had + added);
+        assert!(game.commit());
+        // the maps drawn with the pair look as they did: nothing of theirs moved
+        let untouched = Game::open(bytes.clone(), &path, Profile::default()).unwrap();
+        let index = game.maps.iter().position(|m| m.layout.pair() == to).unwrap();
+        assert!(game.render_map(&game.load_map(index).unwrap()) == untouched.render_map(&untouched.load_map(index).unwrap()));
+
+        // the edits carry the tiles and the palette to another copy of the ROM
+        let edits = game.collect_edits();
+        let told = edits.tilesets.values().next().unwrap();
+        assert_eq!((edits.tilesets.len(), told.tiles.len()), (1, added), "{path}");
+        let mut copy = Game::open(bytes, &path, Profile::default()).unwrap();
+        let applied = copy.apply_edits(&Edits::from_json(&edits.to_json()).unwrap());
+        assert!(applied.skipped.is_empty(), "{path}: {:?}", applied.skipped);
+        copy.commit();
+        assert!(copy.collect_edits() == edits, "{path}: the copy's edits differ");
+        assert!(game.undo().is_some() && !game.modified(), "{path}: undone in one step");
+        println!("{path}: {brought} tiles brought from one tileset to another ({added} new, {} palette(s) written)", told.palettes.len());
     }
 }

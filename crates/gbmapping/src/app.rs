@@ -29,6 +29,10 @@ pub struct Settings {
     pub show_elevation: bool,
     /// The read-only view next to the map
     pub show_reference: bool,
+    /// The tileset tab draws each tile in the palette it's used with (else all in the selected quarter's)
+    pub usual_colors: bool,
+    /// The tileset tab lists every tileset's tiles, not only the map's two
+    pub all_tilesets: bool,
     pub tab: Tab,
 }
 
@@ -43,6 +47,8 @@ impl Default for Settings {
             show_collision: false,
             show_elevation: false,
             show_reference: false,
+            usual_colors: true,
+            all_tilesets: false,
             tab: Tab::Metatiles,
         }
     }

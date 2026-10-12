@@ -43,6 +43,9 @@ const tile = (x, y) => [242 + x * 16 * ZOOM + 8 * ZOOM, 46 + y * 16 * ZOOM + 8 *
 /// three columns are whole in each; `across` is how far into the tile to aim.
 const besideTile = (x, y, across = 0.5) => [242 + (x + across) * 16 * ZOOM, 97 + (y + 0.5) * 16 * ZOOM];
 const referenceTile = (x, y, across = 0.5) => [682 + (x + across) * 16 * ZOOM, 97 + (y + 0.5) * 16 * ZOOM];
+/// In the tileset tab: the button that goes to a metatile no map shows, the "All
+/// tilesets" box, and three places in the list of tiles under them
+const tilesetPanel = { nextFree: [WIDTH - 292 + 40, 110], allTilesets: [WIDTH - 292 + 119, 330], list: [[WIDTH - 220, 500], [WIDTH - 100, 620], [WIDTH - 180, 740]] };
 /// Where the two maps' top left corners are then
 const [mapCorner, referenceCorner] = [[242, 97], [682, 97]];
 /// The reference's source menu, and its entries when the ROM keeps its maps' originals
@@ -213,6 +216,32 @@ try {
     check('and the original again when asked', Math.abs(again - original) < 0.01, `${(again * 100).toFixed(1)}%`);
     await browser.key('r');
   }
+
+  // -- the tileset tab: a tile of another tileset goes into a metatile of this map's ----------------
+  const edited = await download(toolbar.exportEdits);
+  await browser.click(...tile(1, 1), 'right');
+  await browser.click(...tilesetTab);
+  await browser.click(...tilesetPanel.nextFree);
+  await shot('tileset-tab-colours');
+  await browser.click(...tilesetPanel.allTilesets);
+  await browser.move(...tilesetPanel.list[0]);
+  await browser.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: tilesetPanel.list[0][0], y: tilesetPanel.list[0][1], deltaX: 0, deltaY: 6000 });
+  await browser.wait(500);
+  for (const place of tilesetPanel.list) await browser.click(...place);
+  await browser.move(WIDTH / 2, HEIGHT / 2);
+  await shot('tile-of-another-tileset');
+  const withTile = await download(toolbar.exportEdits);
+  const tilesets = Object.values((withTile ? JSON.parse(withTile.toString()) : {}).tilesets ?? {});
+  const count = (what) => tilesets.reduce((n, tileset) => n + Object.keys(tileset[what] ?? {}).length, 0);
+  check('a tile of another tileset goes into a metatile: the edits carry the tile and the metatile', count('tiles') >= 1 && count('metatiles') >= 1, `${count('tiles')} tile(s), ${count('palettes')} palette(s), ${count('metatiles')} metatile(s)`);
+  let back = withTile;
+  for (let i = 0; i < 6 && !(back && edited && back.equals(edited)); i++) {
+    await browser.key('z', { ctrl: true });
+    back = await download(toolbar.exportEdits);
+  }
+  check('undone, the edits are what they were', !!back && !!edited && back.equals(edited));
+  await browser.click(...tilesetPanel.allTilesets);
+  await browser.click(...metatilesTab);
 
   // -- the edits are kept from one visit to the next --------------------------------------------
   await browser.wait(500);

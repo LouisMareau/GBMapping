@@ -13,6 +13,7 @@ pub mod rom;
 pub mod scan;
 pub mod structs;
 pub mod text;
+pub mod tiles;
 
 pub use edits::Edits;
 pub use format::{block, Family, Format};

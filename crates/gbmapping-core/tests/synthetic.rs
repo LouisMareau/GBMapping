@@ -3,6 +3,7 @@
 
 use gbmapping_core::format::block;
 use gbmapping_core::text;
+use gbmapping_core::tiles::{BorrowError, Borrowed, Colors};
 use gbmapping_core::{closest_metatile, Edits, Family, Game, Image, MapId, OpenError, Profile};
 
 const RED: u16 = 0x001F;
@@ -104,6 +105,9 @@ impl Builder {
     }
 }
 
+/// How much unused space the made-up ROMs end with
+const FREE: usize = 0x2000;
+
 struct Synth {
     bytes: Vec<u8>,
     groups_table: usize,
@@ -187,6 +191,8 @@ fn synth_with(code: &str, kanto: bool, wide: bool) -> Synth {
         }
     }
     b.words(&[0, 0]);
+    // the unused end of a cartridge
+    b.bytes.extend_from_slice(&[0xFF; FREE]);
     Synth { bytes: b.bytes, groups_table, layouts_table, primary, secondary, first_secondary }
 }
 
@@ -262,8 +268,6 @@ fn draws_the_metatiles() {
         let layer = game.render_layer(map.pair, &game.entries(map.pair, 1), 1);
         assert_eq!(layer.pixel(0, 0), [0, 0, 0, 0], "an empty top layer is see-through");
         assert_eq!(game.render_layer(map.pair, &game.entries(map.pair, 1), 0).pixel(8, 8), [255, 0, 0, 255]);
-        let tiles = game.render_tiles(map.pair, 0, 16);
-        assert_eq!(tiles.pixel(8, 0), [255, 0, 0, 255]);
         assert_eq!(game.gfx(map.pair).tile_count(), s.first_secondary as usize + 1);
     }
 }
@@ -519,6 +523,10 @@ fn a_map_comes_with_its_original_when_the_profile_tells_where() {
         // the other maps have none, and the game's own pairs are the maps' alone
         assert!(game.maps[1].original.is_none() && game.load_original(1).is_none() && game.load_original(9).is_none());
         assert_eq!(game.pairs().len(), 1);
+        // the original's pair is told apart; its tilesets here are ones the maps are on too
+        assert_eq!(game.original_pairs().into_iter().collect::<Vec<_>>(), [original.pair]);
+        assert!(game.original_tilesets().is_empty());
+        assert_eq!(game.pair_with(s.secondary), Some((map.pair, true)), "a tileset goes by a pair of the maps first");
 
         // ids that are no layout: nothing there, past the table, not a pointer, the map's own layout
         for id in [0, 3, 5, 6, 400, 1] {
@@ -528,5 +536,173 @@ fn a_map_comes_with_its_original_when_the_profile_tells_where() {
         // and without the table's address, ids mean nothing
         let json = r#"{"groups": [{"name": "A", "maps": [{"name": "A", "original": 4}, "B"]}]}"#;
         assert!(Game::open(s.bytes.clone(), "synth.gba", Profile::from_json(json).unwrap()).unwrap().maps[0].original.is_none());
+    }
+}
+
+#[test]
+fn a_tile_is_shown_in_the_palette_it_is_used_with() {
+    for (s, family) in both() {
+        let game = open(&s);
+        let pair = game.maps[0].layout.pair();
+        let own = game.format.primary_palettes as u8;
+        let usage = game.tile_usage();
+        assert_eq!((usage.usual(s.primary, 1), usage.usual(s.primary, 2), usage.uses(s.primary, 1)), (Some(0), Some(0), 4), "{family:?}");
+        assert_eq!(usage.usual(s.secondary, 0), Some(own), "the secondary tileset's tile, in its own palette");
+        assert_eq!((usage.usual(s.secondary, 3), usage.uses(s.secondary, 3)), (None, 0));
+        assert_eq!(usage.shown(s.secondary, 3), own, "a tile no metatile uses is shown like its neighbour");
+        assert_eq!(usage.shown(1, 3), 0, "and one of an unknown tileset in the first palette");
+
+        let sheet = game.tile_sheet(pair, true, &usage, None, 16);
+        assert_eq!((sheet.count, sheet.palettes.as_slice()), (1, &[own][..]));
+        assert_eq!(sheet.image.pixel(0, 0), [0, 0, 255, 255], "blue, as the metatile that uses it draws it");
+        assert_eq!(game.tile_sheet(pair, true, &usage, Some(0), 16).image.pixel(0, 0), [255, 0, 0, 255], "red in the palette asked for");
+        let first = game.tile_sheet(pair, false, &usage, None, 16);
+        assert_eq!(first.count, game.tileset_tile_count(pair, false));
+        assert!(first.count > 2);
+        assert_eq!(first.image.pixel(0, 0)[3], 0, "what a tile leaves see-through stays so");
+        assert_eq!((first.image.pixel(8, 0), first.image.pixel(16, 0)), ([255, 0, 0, 255], [0, 255, 0, 255]));
+
+        assert_eq!(
+            (game.pair_with(s.secondary), game.pair_with(s.primary), game.pair_with(1)),
+            (Some((pair, true)), Some((pair, false)), None)
+        );
+        // on the maps: the first map's tiles and border, and the shared layout's once
+        let uses = game.metatile_uses();
+        assert_eq!((uses[&s.primary][2], uses[&s.secondary][0], uses[&s.secondary][5]), (3, 1, 1));
+    }
+}
+
+/// A tile in colours 0, 1 and 2 with no pattern to it: nothing a compressor can shorten
+fn shape() -> [u8; 64] {
+    let mut state = 2024u32;
+    std::array::from_fn(|_| {
+        state = state.wrapping_mul(1103515245).wrapping_add(12345);
+        ((state >> 16) % 3) as u8
+    })
+}
+
+#[test]
+fn a_tile_of_another_tileset_is_made_usable_in_a_pair() {
+    for (s, family) in both() {
+        let mut game = open(&s);
+        let pair = game.maps[0].layout.pair();
+        let (own, first) = (game.format.primary_palettes as u8, game.format.primary_tiles as u16);
+        let colors = |list: &[(usize, u16)]| {
+            let mut colors = [0u16; 16];
+            list.iter().for_each(|&(i, color)| colors[i] = color);
+            colors
+        };
+
+        // the pair has the colours and the very tile: nothing to copy
+        let red = game.import_tile(pair, &[1; 64], &colors(&[(1, RED)]));
+        assert_eq!(red, Ok(Borrowed { tile: 1, palette: 0, colors: Colors::Found, existing: true }), "{family:?}");
+        // the colour is elsewhere in the palette: the tile that has it there
+        let green = game.import_tile(pair, &[3; 64], &colors(&[(3, GREEN)]));
+        assert_eq!(green, Ok(Borrowed { tile: 2, palette: 0, colors: Colors::Found, existing: true }));
+        // or in another palette
+        let blue = game.import_tile(pair, &[1; 64], &colors(&[(1, BLUE)]));
+        assert_eq!(blue, Ok(Borrowed { tile: 1, palette: own, colors: Colors::Found, existing: true }));
+        assert_eq!(game.borrow_tile(pair, pair, false, 2, 0), green, "a tile taken where it is, in a palette");
+        assert_eq!(game.borrow_tile(pair, pair, true, 9, 0), Err(BorrowError::Nothing));
+        assert!(!game.commit(), "nothing was written");
+
+        // colours no palette has: a palette no metatile uses takes them, and the tile joins the secondary tileset
+        let pixels = shape();
+        let new_colors = colors(&[(1, 0x7FFF), (2, 0x1234)]);
+        let before = game.tileset(s.secondary).unwrap().tiles;
+        let new = game.import_tile(pair, &pixels, &new_colors);
+        assert_eq!(new, Ok(Borrowed { tile: first + 1, palette: own + 1, colors: Colors::Added, existing: false }));
+        assert_eq!(game.gfx(pair).tile(first + 1), pixels);
+        assert_eq!(game.raw_palettes(pair)[own as usize + 1], new_colors);
+        assert_eq!(game.tileset_tile_count(pair, true), 2);
+        let moved = game.tileset(s.secondary).unwrap().tiles;
+        assert!(
+            moved != before && moved >= s.bytes.len() - FREE,
+            "the tiles no longer fit where they were: they're at the ROM's unused end"
+        );
+
+        // a metatile uses it: its palette is taken. The same shape in other colours is the same tile in the next free palette
+        let mut entries = game.entries(pair, first + 1);
+        entries[0] = (first + 1) | (own as u16 + 1) << 12;
+        game.set_entries(pair, first + 1, &entries);
+        let recolored = game.import_tile(pair, &pixels, &colors(&[(1, 0x0421), (2, 0x4000)]));
+        assert_eq!(recolored, Ok(Borrowed { tile: first + 1, palette: own + 2, colors: Colors::Added, existing: true }));
+        // another shape in colours that are there now: one more tile, grown where the tiles are
+        let mut other = pixels;
+        other[0] = (pixels[0] + 1) % 3;
+        let third = game.import_tile(pair, &other, &new_colors);
+        assert_eq!(third, Ok(Borrowed { tile: first + 2, palette: own + 1, colors: Colors::Found, existing: false }));
+        assert_eq!(game.tileset(s.secondary).unwrap().tiles, moved);
+        assert_eq!((game.gfx(pair).tile(first + 1), game.gfx(pair).tile(first + 2)), (pixels, other));
+        assert!(game.commit());
+
+        // what changed goes into the edits, and from there into another copy
+        let edits = game.collect_edits();
+        let told = &edits.tilesets[&format!("0x{:06X}", s.secondary)];
+        assert_eq!(told.tiles.keys().collect::<Vec<_>>(), ["1", "2"]);
+        assert_eq!(told.tiles["1"].len(), 64);
+        let mut palettes: Vec<usize> = told.palettes.keys().map(|p| p.parse().unwrap()).collect();
+        palettes.sort_unstable();
+        assert_eq!(palettes, [own as usize + 1, own as usize + 2]);
+        assert_eq!(told.palettes[&(own + 1).to_string()], new_colors);
+        assert_eq!(told.metatiles.len(), 1);
+        let mut copy = open(&s);
+        let applied = copy.apply_edits(&Edits::from_json(&edits.to_json()).unwrap());
+        assert_eq!((applied.tilesets, applied.skipped.len()), (1, 0), "{:?}", applied.skipped);
+        assert!(copy.commit());
+        assert_eq!((copy.gfx(pair).tile(first + 1), copy.gfx(pair).tile(first + 2)), (pixels, other));
+        assert_eq!(copy.raw_palettes(pair), game.raw_palettes(pair));
+        assert_eq!(copy.entries(pair, first + 1), entries);
+        assert_eq!(copy.collect_edits(), edits);
+        assert!(copy.render_sheet(pair, 16) == game.render_sheet(pair, 16));
+
+        // undone in one step, tiles, palettes and all
+        assert!(game.undo().is_some());
+        assert_eq!((game.tileset_tile_count(pair, true), game.tileset(s.secondary).unwrap().tiles), (1, before));
+        assert!(!game.modified() && game.collect_edits().is_empty());
+        assert!(game.redo().is_some());
+        assert_eq!(game.gfx(pair).tile(first + 2), other);
+    }
+}
+
+#[test]
+fn a_tile_that_cannot_be_brought_changes_nothing() {
+    for (s, family) in both() {
+        let pair = open(&s).maps[0].layout.pair();
+        let (own, most) = (open(&s).format.primary_palettes, open(&s).format.secondary_tiles());
+        let pixels = shape();
+        let mut colors = [0u16; 16];
+        (colors[1], colors[2]) = (0x7FFF, 0x1234);
+
+        // no unused space at the ROM's end
+        let mut cramped = Game::open(s.bytes[..s.bytes.len() - FREE].to_vec(), "synth.gba", Profile::default()).unwrap();
+        assert_eq!(cramped.import_tile(pair, &pixels, &colors), Err(BorrowError::NoRoom), "{family:?}");
+        assert!(!cramped.commit() && !cramped.modified());
+
+        // a secondary tileset with every tile it can hold
+        let mut full = open(&s);
+        let secondary = full.tileset(s.secondary).unwrap();
+        assert_eq!(full.store_tiles(&secondary, &vec![0x11; most * 32]), Ok(()));
+        assert_eq!(full.tileset_tile_count(pair, true), most);
+        full.commit();
+        assert_eq!(full.import_tile(pair, &pixels, &colors), Err(BorrowError::Full { tiles: most }));
+        assert!(!full.commit(), "not even the palette");
+        // tiles that aren't compressed can't be told from what follows them
+        let primary = full.tileset(s.primary).unwrap();
+        assert_eq!(full.store_tiles(&primary, &[0; 32]), Err(BorrowError::NotCompressed));
+
+        // every palette taken: the closest colours of the closest palette, and no palette is written
+        let mut taken = open(&s);
+        let first = taken.format.primary_tiles as u16;
+        taken.set_entries(pair, first + 1, &std::array::from_fn(|k| ((own + k) as u16) << 12));
+        taken.commit();
+        let before = taken.raw_palettes(pair);
+        let mut reddish = [0u16; 16];
+        reddish[1] = 0x001E;
+        assert_eq!(
+            taken.import_tile(pair, &[1; 64], &reddish),
+            Ok(Borrowed { tile: 1, palette: 0, colors: Colors::Approximated, existing: true })
+        );
+        assert!(taken.raw_palettes(pair) == before && !taken.commit());
     }
 }

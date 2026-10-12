@@ -462,8 +462,18 @@ impl Game {
         self.maps.iter().map(|m| m.layout.pair()).collect()
     }
 
+    /// The tileset struct at an offset, as it was when the ROM was opened
+    pub(crate) fn original_tileset(&self, offset: usize) -> Option<Tileset> {
+        Reader { rom: &self.original, format: self.format, mapsec16: self.mapsec16 }.tileset(offset)
+    }
+
+    /// The tiles read so far are read again: the ROM changed under them
+    pub(crate) fn forget_tiles(&self) {
+        self.tiles.borrow_mut().clear();
+    }
+
     /// A tileset's tile graphics (4bpp), decompressed if needed
-    fn tiles(&self, offset: usize, primary: bool) -> Rc<Vec<u8>> {
+    pub(crate) fn tiles(&self, offset: usize, primary: bool) -> Rc<Vec<u8>> {
         if let Some(t) = self.tiles.borrow().get(&offset) {
             return t.clone();
         }
@@ -625,6 +635,7 @@ impl Game {
         self.commit_pending();
         let patch = self.undo.pop()?;
         self.rom.revert(&patch);
+        self.forget_tiles();
         let at = patch.changes.first().map(|c| c.offset as usize);
         self.redo.push(patch);
         at
@@ -634,6 +645,7 @@ impl Game {
         self.commit_pending();
         let patch = self.redo.pop()?;
         self.rom.reapply(&patch);
+        self.forget_tiles();
         let at = patch.changes.first().map(|c| c.offset as usize);
         self.undo.push(patch);
         at
@@ -673,28 +685,6 @@ impl Game {
             if self.locate(pair, id as u16).is_some() {
                 gfx.draw_metatile(&mut image, (id % columns) * METATILE, (id / columns) * METATILE, &self.entries(pair, id as u16));
             }
-        }
-        image
-    }
-
-    /// Every tile of a pair in one of its palettes, `columns` to a row
-    pub fn render_tiles(&self, pair: Pair, palette: usize, columns: usize) -> Image {
-        let gfx = self.gfx(pair);
-        let count = gfx.tile_count();
-        let mut image = Image::filled(columns * TILE, count.div_ceil(columns).max(1) * TILE, [0, 0, 0, 0]);
-        let palette = gfx.palettes[palette.min(gfx.palettes.len() - 1)];
-        for t in 0..count {
-            gfx::draw_tile(
-                &mut image.rgba,
-                image.width,
-                &gfx.tile(t as u16),
-                &palette,
-                (t % columns) * TILE,
-                (t / columns) * TILE,
-                false,
-                false,
-                false,
-            );
         }
         image
     }

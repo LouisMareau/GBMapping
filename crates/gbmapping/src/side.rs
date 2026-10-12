@@ -2,17 +2,17 @@
 //! where a metatile's tiles and attributes are edited.
 
 use crate::app::{Settings, Tab};
-use crate::doc::{texture, Doc, LayerTextures, Stamp, TilesTexture, PICKER_COLUMNS};
+use crate::doc::{texture, Doc, LayerTextures, Stamp, PICKER_COLUMNS, TILE_COLUMNS};
 use crate::map_view::{scale_for, snap};
 use egui::{pos2, vec2, Align, Color32, Mesh, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui, Vec2};
 use gbmapping_core::format::{block, AttrField};
 use gbmapping_core::gfx::{TileEntry, METATILE, TILE};
+use gbmapping_core::tiles::{Borrowed, Colors};
 use gbmapping_core::{Game, Pair};
 
 const ACCENT: Color32 = Color32::from_rgb(76, 175, 80);
 const GROUND: Color32 = Color32::from_gray(17);
 const WHOLE: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-const TILE_COLUMNS: usize = 16;
 
 pub fn show(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings) {
     ui.add_space(4.0);
@@ -25,7 +25,7 @@ pub fn show(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings) {
     let Some(pair) = doc.map.as_ref().map(|m| m.pair) else { return };
     match settings.tab {
         Tab::Metatiles => picker(ui, doc, pair),
-        Tab::Tileset => tileset(ui, doc, pair),
+        Tab::Tileset => tileset(ui, doc, settings, pair),
     }
 }
 
@@ -83,7 +83,7 @@ fn picker(ui: &mut Ui, doc: &mut Doc, pair: Pair) {
     }
     ui.separator();
 
-    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+    egui::ScrollArea::vertical().id_salt("metatiles").auto_shrink(false).show(ui, |ui| {
         let size = vec2(PICKER_COLUMNS as f32, rows as f32) * cell;
         let (response, painter) = ui.allocate_painter(size, Sense::click_and_drag());
         let origin = snap(response.rect.min, ppp);
@@ -120,7 +120,7 @@ fn picker(ui: &mut Ui, doc: &mut Doc, pair: Pair) {
     });
 }
 
-fn tileset(ui: &mut Ui, doc: &mut Doc, pair: Pair) {
+fn tileset(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings, pair: Pair) {
     let ctx = ui.ctx().clone();
     let ppp = ui.pixels_per_point();
     let id = doc.stamp.first();
@@ -131,8 +131,26 @@ fn tileset(ui: &mut Ui, doc: &mut Doc, pair: Pair) {
         return;
     };
     ui.label(egui::RichText::new(format!("Metatile 0x{id:03X}")).strong());
-    let which = if (id as usize) < format.primary_metatiles { "primary" } else { "secondary" };
+    let in_primary = (id as usize) < format.primary_metatiles;
+    let which = if in_primary { "primary" } else { "secondary" };
     ui.label(egui::RichText::new(format!("number {local} of the {which} tileset at 0x{:06X}", tileset.offset)).small().weak());
+    // a metatile no map shows can be rebuilt without changing any map
+    let on_maps = match doc.metatile_uses(tileset.offset, local) {
+        0 => "On no map: free to rebuild".to_string(),
+        n => format!("On the maps {n} times: they change with it"),
+    };
+    ui.horizontal(|ui| {
+        let next = ui.small_button("Next free").on_hover_text(
+            "The next metatile of the secondary tileset that's on no map: one to rebuild as you need, without changing any map.",
+        );
+        if next.clicked() {
+            match doc.next_free_metatile(pair, id) {
+                Some(free) => doc.select_metatile(free),
+                None => doc.notice = Some("Every metatile of this map's secondary tileset is on a map".to_string()),
+            }
+        }
+        ui.label(egui::RichText::new(on_maps).small().weak());
+    });
     ui.add_space(4.0);
 
     let mut entries = doc.game.entries(pair, id);
@@ -216,37 +234,94 @@ fn tileset(ui: &mut Ui, doc: &mut Doc, pair: Pair) {
 
     // -- the tiles: click one to put it in the selected quarter -----------------------------
     ui.separator();
-    let palette = entry.palette as usize;
-    if doc.tiles.as_ref().is_none_or(|t| (t.pair, t.palette) != (pair, palette)) {
-        let image = doc.game.render_tiles(pair, palette, TILE_COLUMNS);
-        doc.tiles = Some(TilesTexture { pair, palette, texture: texture(&ctx, "tiles", &image), count: doc.game.gfx(pair).tile_count() });
-    }
-    let Some((tiles_texture, tile_count)) = doc.tiles.as_ref().map(|t| (t.texture.id(), t.count)) else { return };
-    let tile_rows = tile_count.div_ceil(TILE_COLUMNS).max(1);
-    let cell = TILE as f32 * scale_for(2, ppp);
-    let mut hovered_tile = None;
-    let hint = ui.label(egui::RichText::new(format!("Tiles, in palette {palette}")).small());
-    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-        let size = vec2(TILE_COLUMNS as f32, tile_rows as f32) * cell;
-        let (response, painter) = ui.allocate_painter(size, Sense::click());
-        let origin = snap(response.rect.min, ppp);
-        let rect = Rect::from_min_size(origin, size);
-        painter.rect_filled(rect, 0.0, GROUND);
-        painter.image(tiles_texture, rect, WHOLE, Color32::WHITE);
-        let tile_at = |p: Pos2| {
-            ((p.y - origin.y) / cell).max(0.0) as usize * TILE_COLUMNS + (((p.x - origin.x) / cell).max(0.0) as usize).min(TILE_COLUMNS - 1)
-        };
-        hovered_tile = response.hover_pos().map(tile_at).filter(|&t| t < tile_count);
-        if let Some(t) = response.interact_pointer_pos().filter(|_| response.clicked()).map(tile_at).filter(|&t| t < tile_count) {
-            entry.tile = t as u16;
-        }
-        let t = entry.tile as usize;
-        let selected = Rect::from_min_size(origin + vec2((t % TILE_COLUMNS) as f32, (t / TILE_COLUMNS) as f32) * cell, Vec2::splat(cell));
-        painter.rect_stroke(selected, 0.0, Stroke::new(1.5, ACCENT), StrokeKind::Outside);
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut settings.usual_colors, "Usual colours").on_hover_text(
+            "A tile has no colours of its own: each metatile draws it in one of the palettes.\nOn: each tile in the palette it's used with the most, and a click takes the tile with that palette.\nOff: every tile in the selected quarter's palette, to try a tile in another one.",
+        );
+        ui.checkbox(&mut settings.all_tilesets, "All tilesets").on_hover_text(
+            "Lists the tiles of every tileset, not only this map's two.\nA metatile can only be made of its own tilesets' tiles: a click on a tile of another tileset copies it into this map's secondary tileset, with its colours.",
+        );
     });
-    if let Some(t) = hovered_tile {
-        hint.on_hover_text(format!("tile {t}"));
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    let hint = if doc.tile_hint.is_empty() { "Tiles: click one to put it in the selected quarter" } else { doc.tile_hint.as_str() };
+    ui.add(egui::Label::new(egui::RichText::new(hint).small()).truncate());
+    let forced = (!settings.usual_colors).then_some(entry.palette);
+    let sections = doc.tile_sections(pair, settings.all_tilesets);
+    let cell = TILE as f32 * scale_for(2, ppp);
+    let (mut hovered, mut borrow) = (String::new(), None);
+    // another metatile or another quarter: the list goes to the quarter's tile
+    let shown = (pair, id, doc.entry);
+    let find = doc.tiles_shown.replace(shown) != Some(shown);
+    egui::ScrollArea::vertical().id_salt("tiles").auto_shrink(false).show(ui, |ui| {
+        for section in sections.iter() {
+            ui.label(egui::RichText::new(&section.label).small().weak());
+            let rows = section.count.div_ceil(TILE_COLUMNS).max(1);
+            let size = vec2(TILE_COLUMNS as f32, rows as f32) * cell;
+            let (response, painter) = ui.allocate_painter(size, Sense::click());
+            let origin = snap(response.rect.min, ppp);
+            let place = |t: usize| {
+                Rect::from_min_size(origin + vec2((t % TILE_COLUMNS) as f32, (t / TILE_COLUMNS) as f32) * cell, Vec2::splat(cell))
+            };
+            let selected = section.base.and_then(|base| (entry.tile as usize).checked_sub(base as usize)).filter(|&t| t < section.count);
+            if let Some(t) = selected.filter(|_| find) {
+                ui.scroll_to_rect(place(t).expand(cell * 4.0), Some(Align::Center));
+            }
+            // the tilesets out of sight aren't drawn: there can be dozens
+            if !ui.is_rect_visible(response.rect) {
+                continue;
+            }
+            let sheet = doc.tile_sheet(&ctx, section.pair, section.secondary, forced);
+            let rect = Rect::from_min_size(origin, size);
+            painter.rect_filled(rect, 0.0, GROUND);
+            // of another tileset, the rows down to its last tile that draws something
+            let drawn = rows as f32 / sheet.palettes.len().div_ceil(TILE_COLUMNS).max(1) as f32;
+            painter.image(sheet.texture.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, drawn.min(1.0))), Color32::WHITE);
+            let tile_at = |p: Pos2| {
+                ((p.y - origin.y) / cell).max(0.0) as usize * TILE_COLUMNS
+                    + (((p.x - origin.x) / cell).max(0.0) as usize).min(TILE_COLUMNS - 1)
+            };
+            let palette_of = |t: usize| sheet.palettes.get(t).copied().unwrap_or(0);
+            if let Some(t) = response.hover_pos().map(tile_at).filter(|&t| t < section.count) {
+                hovered = match section.base {
+                    Some(base) => format!("Tile 0x{:03X} (palette {})", base as usize + t, palette_of(t)),
+                    None => format!("Tile {t} there (palette {}): a click copies it into this map's tileset", palette_of(t)),
+                };
+                painter.rect_stroke(place(t), 0.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Outside);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if let Some(t) = response.interact_pointer_pos().filter(|_| response.clicked()).map(tile_at).filter(|&t| t < section.count) {
+                match section.base {
+                    // a metatile of the primary tileset is the same on every map: it can't count on this map's secondary tiles
+                    Some(base) if in_primary && base > 0 => doc.notice = Some(primary_only(id)),
+                    Some(base) => {
+                        entry.tile = base + t as u16;
+                        if settings.usual_colors {
+                            entry.palette = palette_of(t);
+                        }
+                    }
+                    None => borrow = Some((section.pair, section.secondary, t, palette_of(t))),
+                }
+            }
+            if let Some(t) = selected {
+                painter.rect_stroke(place(t), 0.0, Stroke::new(1.5, ACCENT), StrokeKind::Outside);
+            }
+        }
+    });
+    doc.tile_hint = hovered;
+
+    // a tile of another tileset: copied into this map's secondary tileset, in colours the pair has or can take
+    if let Some((from, secondary, tile, palette)) = borrow {
+        if in_primary {
+            doc.notice = Some(primary_only(id));
+        } else {
+            match doc.game.borrow_tile(pair, from, secondary, tile, palette) {
+                Ok(borrowed) => {
+                    (entry.tile, entry.palette) = (borrowed.tile, borrowed.palette);
+                    doc.notice = Some(borrowed_as(&borrowed));
+                    doc.tileset_changed();
+                }
+                Err(e) => doc.notice = Some(e.to_string()),
+            }
+        }
     }
 
     // -- into the ROM --------------------------------------------------------------------------
@@ -259,6 +334,26 @@ fn tileset(ui: &mut Ui, doc: &mut Doc, pair: Pair) {
     // a value dragged is one step once the button is released, not one per frame
     if !ui.input(|i| i.pointer.any_down()) {
         doc.game.commit();
+    }
+}
+
+fn primary_only(id: u16) -> String {
+    format!("Metatile 0x{id:03X} is in the primary tileset, which every map shares: it's made of the primary tileset's tiles only. Tiles of the other tilesets go into the secondary tileset's metatiles.")
+}
+
+/// What became of a tile taken in another tileset
+fn borrowed_as(borrowed: &Borrowed) -> String {
+    let tile = if borrowed.existing {
+        format!("This map's tilesets had that tile: 0x{:03X}", borrowed.tile)
+    } else {
+        format!("Copied into this map's secondary tileset as tile 0x{:03X}", borrowed.tile)
+    };
+    match borrowed.colors {
+        Colors::Found => format!("{tile}, in palette {}", borrowed.palette),
+        Colors::Added => format!("{tile}; its colours were written to palette {}, which no metatile used", borrowed.palette),
+        Colors::Approximated => {
+            format!("{tile}; no palette has its colours and none is free: it's in the closest ones of palette {}", borrowed.palette)
+        }
     }
 }
 

@@ -6,11 +6,16 @@ use egui::{ColorImage, TextureHandle, TextureOptions};
 use gbmapping_core::format::block;
 use gbmapping_core::game::BlockUsage;
 use gbmapping_core::gfx::METATILE;
+use gbmapping_core::structs::Layout;
+use gbmapping_core::tiles::TileUsage;
 use gbmapping_core::{closest_metatile, Game, Image, Map, Pair};
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::rc::Rc;
 
 /// Metatiles per row in the picker: the games' tilesets are laid out for 8
 pub const PICKER_COLUMNS: usize = 8;
+/// Tiles per row in the tileset tab
+pub const TILE_COLUMNS: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum Tool {
@@ -178,6 +183,10 @@ pub struct Doc {
     pub scroll: egui::Vec2,
     /// Something to tell in the status line
     pub notice: Option<String>,
+    /// What the pointer is over in the tileset tab's tiles
+    pub tile_hint: String,
+    /// The pair, metatile and quarter the tileset tab's tiles were last shown for
+    pub tiles_shown: Option<(Pair, u16, usize)>,
     /// Where the two maps' views begin on the screen, and how tall the strip over the
     /// edited map is: adjusted until both begin at the same height, tile facing tile
     pub map_top: f32,
@@ -185,16 +194,40 @@ pub struct Doc {
     pub strip: f32,
     sheets: HashMap<Pair, Sheet>,
     usage: HashMap<Pair, HashMap<u16, BlockUsage>>,
-    pub tiles: Option<TilesTexture>,
     pub layers: Option<LayerTextures>,
+    /// How the metatiles use the tiles, and the maps the metatiles: until something changes
+    tile_usage: Option<Rc<TileUsage>>,
+    metatile_uses: Option<HashMap<usize, Vec<u32>>>,
+    /// The tilesets the tileset tab lists (for a pair, with or without the others), and their tiles as drawn
+    tile_sections: Option<TileSections>,
+    tile_sheets: HashMap<(Pair, bool, Option<u8>), Rc<TilesTexture>>,
 }
 
-/// The tileset tab's sheet of tiles: a pair's tiles in one of its palettes
+/// A tileset's tiles as the tileset tab draws them
 pub struct TilesTexture {
-    pub pair: Pair,
-    pub palette: usize,
     pub texture: TextureHandle,
+    /// The palette each tile is drawn in
+    pub palettes: Vec<u8>,
+}
+
+/// The tileset tab's list, as made for a map's pair (and its original's), with or
+/// without the other tilesets
+struct TileSections {
+    pair: Pair,
+    original: Option<Pair>,
+    all: bool,
+    list: Rc<Vec<TileSection>>,
+}
+
+/// A tileset in the tileset tab's list of tiles
+pub struct TileSection {
+    pub label: String,
+    /// The pair it's taken in (its palettes), and whether it's that pair's secondary one
+    pub pair: Pair,
+    pub secondary: bool,
     pub count: usize,
+    /// Where its tiles begin in the map's pair, when it's one of the map's two tilesets
+    pub base: Option<u16>,
 }
 
 /// The tileset tab's two layers of a metatile, as drawn from its entries
@@ -225,13 +258,18 @@ impl Doc {
             cursor: None,
             scroll: egui::Vec2::ZERO,
             notice: None,
+            tile_hint: String::new(),
+            tiles_shown: None,
             map_top: 0.0,
             reference_top: 0.0,
             strip: 0.0,
             sheets: HashMap::new(),
             usage: HashMap::new(),
-            tiles: None,
             layers: None,
+            tile_usage: None,
+            metatile_uses: None,
+            tile_sections: None,
+            tile_sheets: HashMap::new(),
         };
         doc.open_map(0);
         doc
@@ -248,8 +286,7 @@ impl Doc {
     /// changed the ROM behind the map on screen
     pub fn reload(&mut self) {
         self.stroke = None;
-        self.sheets.clear();
-        self.tiles = None;
+        self.forget_tilesets();
         self.layers = None;
         if let Some(index) = self.map.as_ref().map(|m| m.index) {
             self.map = self.game.load_map(index);
@@ -260,12 +297,125 @@ impl Doc {
     fn changed(&mut self) {
         self.edited = self.game.edited_layouts();
         self.unsaved_edits = true;
+        self.metatile_uses = None;
     }
 
-    /// A tileset's metatiles were written to: their pictures are to be drawn again
-    pub fn tileset_changed(&mut self) {
+    // What was drawn or counted from the tilesets is to be drawn and counted again
+    fn forget_tilesets(&mut self) {
         self.sheets.clear();
+        self.tile_usage = None;
+        self.tile_sections = None;
+        self.tile_sheets.clear();
+    }
+
+    /// A tileset was written to (its metatiles, its tiles, its palettes)
+    pub fn tileset_changed(&mut self) {
+        self.forget_tilesets();
         self.changed();
+    }
+
+    /// How the metatiles use the tiles: which palette each tile is drawn in
+    pub fn tile_usage(&mut self) -> Rc<TileUsage> {
+        let game = &self.game;
+        self.tile_usage.get_or_insert_with(|| Rc::new(game.tile_usage())).clone()
+    }
+
+    /// How many tiles of the maps a metatile of a tileset is on
+    pub fn metatile_uses(&mut self, tileset: usize, local: usize) -> u32 {
+        let game = &self.game;
+        self.metatile_uses.get_or_insert_with(|| game.metatile_uses()).get(&tileset).and_then(|uses| uses.get(local)).copied().unwrap_or(0)
+    }
+
+    /// The next metatile of a pair's secondary tileset that no map shows, after `id`
+    /// (and from the tileset's first one again): one to rebuild without changing any map
+    pub fn next_free_metatile(&mut self, pair: Pair, id: u16) -> Option<u16> {
+        let first = self.game.format.primary_metatiles;
+        let count = self.game.metatile_count(pair);
+        let after = (id as usize + 1).max(first);
+        let mut candidates = (after..count).chain(first..after.min(count));
+        candidates.find(|&i| self.metatile_uses(pair.secondary, i - first) == 0).map(|i| i as u16)
+    }
+
+    /// Takes a metatile as the stamp, and shows it in the picker
+    pub fn select_metatile(&mut self, id: u16) {
+        let (x, y) = (id as usize % PICKER_COLUMNS, id as usize / PICKER_COLUMNS);
+        self.stamp = Stamp::from_picker(x, y, x, y);
+        self.scroll_picker = true;
+    }
+
+    /// The tilesets whose tiles the tileset tab lists for a pair: its own two, and when
+    /// `all` every other one: those of the map's original, those the maps use (of the
+    /// same primary tileset first), then the other originals'
+    pub fn tile_sections(&mut self, pair: Pair, all: bool) -> Rc<Vec<TileSection>> {
+        let game = &self.game;
+        let original = self.map.as_ref().and_then(|m| game.maps.get(m.index)?.original).map(|l| l.pair());
+        if let Some(made) = self.tile_sections.as_ref().filter(|made| (made.pair, made.original, made.all) == (pair, original, all)) {
+            return made.list.clone();
+        }
+        let own = |secondary: bool| TileSection {
+            label: format!(
+                "This map's {} tileset · 0x{:06X}",
+                if secondary { "secondary" } else { "primary" },
+                if secondary { pair.secondary } else { pair.primary }
+            ),
+            pair,
+            secondary,
+            count: game.tileset_tile_count(pair, secondary),
+            base: Some(if secondary { game.format.primary_tiles as u16 } else { 0 }),
+        };
+        let mut sections = vec![own(false), own(true)];
+        if all {
+            // a tileset the maps are on, or one the ROM keeps for what its maps were
+            let other = |offset: usize, kept: bool| -> Option<TileSection> {
+                let (from, secondary) = game.pair_with(offset).filter(|_| offset != pair.primary && offset != pair.secondary)?;
+                // the empty tiles a tileset ends with are of no use to another one
+                let count = Some(game.tileset_drawn_tiles(from, secondary)).filter(|&count| count > 0)?;
+                let on = |l: Layout| l.primary == offset || l.secondary == offset;
+                let mut users = game.maps.iter().filter(|m| if kept { m.original.is_some_and(on) } else { on(m.layout) });
+                let first = users.next().map_or(String::new(), |m| m.name.clone());
+                let more = users.count();
+                let maps = if more > 0 { format!("{first} + {more} maps") } else { first };
+                let label = format!("0x{offset:06X} · {}{maps}", if kept { "original of " } else { "" });
+                Some(TileSection { label, pair: from, secondary, count, base: None })
+            };
+            let mut others: Vec<TileSection> = game.tilesets().iter().filter_map(|(t, _)| other(t.offset, false)).collect();
+            // the secondary tilesets that go with this map's primary one first: their primary colours are this map's
+            others.sort_by_key(|s| (s.pair.primary != pair.primary, !s.secondary));
+            let mut kept: Vec<TileSection> = game.original_tilesets().iter().filter_map(|(t, _)| other(t.offset, true)).collect();
+            // what this map was drawn with before comes right under its own tilesets
+            let (mut its, rest): (Vec<TileSection>, Vec<TileSection>) = {
+                let of_this = |s: &TileSection| {
+                    original.is_some_and(|o| if s.secondary { s.pair.secondary == o.secondary } else { s.pair.primary == o.primary })
+                };
+                kept.drain(..).partition(of_this)
+            };
+            for section in &mut its {
+                section.label = format!(
+                    "This map's original · {} tileset · 0x{:06X}",
+                    if section.secondary { "secondary" } else { "primary" },
+                    if section.secondary { section.pair.secondary } else { section.pair.primary }
+                );
+            }
+            its.sort_by_key(|s| s.secondary);
+            sections.extend(its);
+            sections.extend(others);
+            sections.extend(rest);
+        }
+        let list = Rc::new(sections);
+        self.tile_sections = Some(TileSections { pair, original, all, list: list.clone() });
+        list
+    }
+
+    /// A tileset's tiles, drawn: each in its usual palette, or all in `palette`
+    pub fn tile_sheet(&mut self, ctx: &egui::Context, pair: Pair, secondary: bool, palette: Option<u8>) -> Rc<TilesTexture> {
+        if let Some(sheet) = self.tile_sheets.get(&(pair, secondary, palette)) {
+            return sheet.clone();
+        }
+        let usage = self.tile_usage();
+        let sheet = self.game.tile_sheet(pair, secondary, &usage, palette, TILE_COLUMNS);
+        let drawn = Rc::new(TilesTexture { texture: texture(ctx, "tiles", &sheet.image), palettes: sheet.palettes });
+        self.tile_sheets.insert((pair, secondary, palette), drawn.clone());
+        drawn
     }
 
     /// Ends an edit made through the game (tileset edits, imports)

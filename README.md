@@ -21,7 +21,8 @@ and a hack all open the same way.
 | Pokémon Ruby, Sapphire | AXV*, AXP* | same data layout as Emerald; not yet tried on a ROM |
 | Pokémon FireRed, LeafGreen | BPR*, BPG* | their own layout (640 primary metatiles, 32-bit attributes, sized borders), written from pokefirered and checked on made-up ROMs only; not yet tried on a real one |
 
-Not there yet: tile graphics and palettes (shown, not edited), map sizes,
+Not there yet: drawing tiles and choosing colours (tiles are copied from one
+tileset to another, not drawn), more metatiles than a tileset has, map sizes,
 events and connections, metatiles of three layers, the Game Boy Color games.
 
 ## Using it
@@ -44,7 +45,8 @@ events and connections, metatiles of three layers, the Game Boy Color games.
   picker: click one of its tiles to set it from the selection.
 - **Tileset** tab: the selected metatile's two layers. Click a quarter, then a
   tile below; set flips, palette, behavior (by name) and layer type. The map
-  updates at once.
+  updates at once. The tiles can be those of [any
+  tileset](#metatiles-from-any-tileset).
 - **Undo** / **Redo** (Ctrl+Z, Ctrl+Y) cover everything, map after map.
 - **Save ROM** gives the ROM with your edits. **Export edits** gives a small
   `.json` with only what changed; **Import edits…** (or dropping that file)
@@ -81,6 +83,43 @@ shown in both.
   the **closest-looking metatile** of the edited map's tilesets, with the
   collision and elevation the original had. It's a first draft to correct,
   not a conversion.
+
+### Metatiles from any tileset
+
+A metatile is eight tiles, each drawn in one of the map's palettes. The
+**Tileset** tab lists the tiles under the metatile:
+
+- **Usual colours** (on by default): a tile has no colours of its own, so each
+  is shown in the palette the metatiles use it with the most, and a click
+  takes the tile with that palette. Off, every tile is shown in the selected
+  quarter's palette instead, to try a tile in other colours: the list then
+  changes colours with the quarter picked.
+- **All tilesets** lists, under the map's two tilesets, every other tileset
+  the ROM's maps use (those that go with the same primary tileset first),
+  each with a map that uses it. When the ROM keeps [its maps'
+  originals](#the-maps-originals), the tilesets those came with are there
+  too: this map's original's right under its own two, the other originals'
+  last. A map can only draw its own two tilesets' tiles, so a click on a tile
+  of another one **copies it into the map's secondary tileset**, with its
+  colours:
+  - a palette of the map that already has those colours is used;
+  - else they're written to a palette of the secondary tileset that no
+    metatile uses;
+  - else the tile is put in the closest colours a palette has, and the status
+    bar says so.
+
+  A tile the map's tilesets already have isn't copied twice. The copy is one
+  step to undo, and goes in the saved ROM and in the edits file. When the
+  tileset's tiles no longer fit where they were, they're written to free space
+  at the end of the ROM.
+- **Next free** goes to the next metatile of the secondary tileset that no map
+  shows: one to rebuild without changing any map. The line next to it tells
+  how many times the selected metatile is on the maps.
+
+The limits: a secondary tileset holds a fixed number of tiles (the status bar
+says when it's full); the tiles must be compressed in the ROM, as the games' are;
+a metatile of the primary tileset, which every map shares, only takes the
+primary tileset's tiles.
 
 ### As an app
 
@@ -137,12 +176,21 @@ it, and it isn't part of the edits files.
 ```json
 {"format": "GBMapping/1", "game": "BPEE", "title": "POKEMON EMER",
  "maps": {"0.9": {"width": 20, "height": 20, "blocks": [], "border": []}},
- "tilesets": {"0x3DF704": {"metatiles": {"12": [1, 2, 3, 4, 5, 6, 7, 8]}, "attributes": {"12": 3}}}}
+ "tilesets": {"0x3DF704": {"metatiles": {"12": [1, 2, 3, 4, 5, 6, 7, 8]}, "attributes": {"12": 3},
+                           "tiles": {"498": "0011…"}, "palettes": {"12": [0, 32767]}}}}
 ```
 
 Maps go by `group.number` (a layout several maps share is told once), tilesets
 by ROM address, metatiles by their number in the tileset. A block is
-`metatile | collision << 10 | elevation << 12`.
+`metatile | collision << 10 | elevation << 12`; a metatile is eight
+`tile | hflip << 10 | vflip << 11 | palette << 12`.
+
+`tiles` and `palettes` are only there when tiles were brought from another
+tileset: a tile's 32 bytes (4 bits a pixel, as the ROM has them once
+unpacked) in hexadecimal, by its number in the tileset, and a palette's 16
+colours (15 bits each) by its number. What reads an edits file to rebuild a
+game from its sources has to write those too, or the metatiles point at
+tiles that aren't there.
 
 ## Building
 
@@ -195,8 +243,9 @@ checks the built site in a headless Chrome, end to end: a ROM in through the
 file chooser, tiles painted with the mouse, undo, the saved ROM and the
 exported edits compared with what they should be, tiles taken back from the
 reference, a map's original shown on its own tilesets when the profile tells
-one, the edits kept across a reload, the app installable and working
-offline. Screenshots land in `target/browser-check/`.
+one, a tile of another tileset put in a metatile and undone, the edits kept
+across a reload, the app installable and working offline. Screenshots land in
+`target/browser-check/`.
 
 ### Publishing
 
