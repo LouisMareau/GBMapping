@@ -474,9 +474,9 @@ fn name(rom: &Bytes, o: usize) -> Option<String> {
     for i in 0..24 {
         match rom.u8(o + i) {
             0x50 => return (!name.trim().is_empty()).then(|| name.split_whitespace().collect::<Vec<_>>().join(" ")),
-            c @ 0x80..=0x99 => name.push((b'A' + c - 0x80) as char),
-            c @ 0xA0..=0xB9 => name.push((b'a' + c - 0xA0) as char),
-            c @ 0xF6..=0xFF => name.push((b'0' + c - 0xF6) as char),
+            c @ 0x80..=0x99 => name.push((b'A' + (c - 0x80)) as char),
+            c @ 0xA0..=0xB9 => name.push((b'a' + (c - 0xA0)) as char),
+            c @ 0xF6..=0xFF => name.push((b'0' + (c - 0xF6)) as char),
             // a space, and where the Town Map may break the name
             0x7F | 0x1F | 0x22 => name.push(' '),
             0x1E | 0x25 => {}
