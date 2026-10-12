@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
   <title>GBMapping</title>
-  <meta name="description" content="A map and tileset editor for Game Boy Advance ROMs, in the browser: nothing leaves your computer.">
+  <meta name="description" content="A map and tileset editor for Game Boy Advance and Game Boy Color ROMs, in the browser: nothing leaves your computer.">
   <meta name="theme-color" content="#1b1b1b">
   <base data-trunk-public-url />
 
@@ -54,7 +54,7 @@
       document.getElementById('gbmapping').dispatchEvent(new DragEvent('drop', { dataTransfer: transfer, bubbles: true, cancelable: true }));
     };
 
-    // Installed as an app, GBMapping can be the program .gba files open with: the
+    // Installed as an app, GBMapping can be the program .gba and .gbc files open with: the
     // system hands the files over at launch
     if ('launchQueue' in window) {
       window.launchQueue.setConsumer(async (launch) => {

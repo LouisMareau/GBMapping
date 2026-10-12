@@ -1,4 +1,4 @@
-//! GBMapping: a map and tileset editor for Game Boy Advance ROMs. One program for the
+//! GBMapping: a map and tileset editor for Game Boy Advance and Game Boy Color ROMs. One program for the
 //! browser (WebAssembly, installable as an app) and for the desktop.
 
 // No console window behind the desktop app on Windows

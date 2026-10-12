@@ -2,6 +2,7 @@
 //! core does, checked without a copyrighted byte.
 
 use gbmapping_core::format::block;
+use gbmapping_core::metatiles::GrowError;
 use gbmapping_core::text;
 use gbmapping_core::tiles::{BorrowError, Borrowed, Colors};
 use gbmapping_core::{closest_metatile, Edits, Family, Game, Image, MapId, OpenError, Profile};
@@ -245,7 +246,7 @@ fn not_a_game() {
     assert_eq!(Game::open(Vec::new(), "x", Profile::default()).err(), Some(OpenError::Empty));
     let err = Game::open(vec![0; 0x1000], "x", Profile::default()).err().unwrap();
     assert_eq!(err, OpenError::NoMaps { header: String::new(), gba: false });
-    assert!(err.to_string().contains("isn't a Game Boy Advance ROM"));
+    assert!(err.to_string().contains("Game Boy Advance or a Game Boy Color ROM"));
 }
 
 #[test]
@@ -704,5 +705,87 @@ fn a_tile_that_cannot_be_brought_changes_nothing() {
             Ok(Borrowed { tile: 1, palette: 0, colors: Colors::Approximated, existing: true })
         );
         assert!(taken.raw_palettes(pair) == before && !taken.commit());
+    }
+}
+
+#[test]
+fn a_tileset_is_given_new_metatiles() {
+    for (s, family) in both() {
+        let mut game = open(&s);
+        let pair = game.maps[0].layout.pair();
+        let first = s.first_secondary;
+        let (count, before) = (game.metatile_count(pair), game.tileset(s.secondary).unwrap());
+        assert_eq!(count, first as usize + 2, "{family:?}");
+        let pictures: Vec<Image> = (0..3).map(|i| game.render_map(&game.load_map(i).unwrap())).collect();
+        let (entries, attributes) = (game.entries(pair, first), [game.attribute(pair, first), game.attribute(pair, first + 1)]);
+
+        // a new one: empty, at the end of the secondary tileset, whose metatiles and their
+        // attributes are moved to the ROM's unused end to have room
+        let new = game.add_metatile(pair, None).unwrap();
+        assert_eq!((new, game.metatile_count(pair)), (first + 2, count + 1), "{family:?}");
+        assert_eq!((game.entries(pair, new), game.attribute(pair, new)), ([0; 8], 0));
+        let moved = game.tileset(s.secondary).unwrap();
+        assert!(moved.metatiles >= s.bytes.len() - FREE && moved.attributes == moved.metatiles + 3 * 16, "{family:?}: {moved:?}");
+        assert_ne!((moved.metatiles, moved.attributes), (before.metatiles, before.attributes));
+        // the ones it had are what they were
+        assert_eq!((game.entries(pair, first), [game.attribute(pair, first), game.attribute(pair, first + 1)]), (entries, attributes));
+        assert!(game.commit());
+
+        // the copy of another, a primary tileset's here: its tiles and its attributes.
+        // The metatiles grow where they are now.
+        let copy = game.add_metatile(pair, Some(1)).unwrap();
+        assert_eq!(
+            (copy, game.entries(pair, copy), game.attribute(pair, copy)),
+            (first + 3, game.entries(pair, 1), game.attribute(pair, 1))
+        );
+        assert_eq!(game.tileset(s.secondary).unwrap().metatiles, moved.metatiles, "{family:?}");
+        assert!(game.commit());
+        // no map changed for it, and a map takes the new metatile like any other
+        for (i, picture) in pictures.iter().enumerate() {
+            assert!(game.render_map(&game.load_map(i).unwrap()) == *picture, "{family:?}: map {i}");
+        }
+        let mut map = game.load_map(1).unwrap();
+        map.blocks[3] = copy;
+        game.store_map(&map);
+        assert!(game.commit());
+        assert_eq!(game.render_map(&game.load_map(1).unwrap()).pixel(16, 16), [255, 0, 0, 255]);
+
+        // the edits tell the new metatiles whole, the empty one too, and no other:
+        // the tileset's own aren't told for having been moved
+        let edits = game.collect_edits();
+        let told = &edits.tilesets[&format!("0x{:06X}", s.secondary)];
+        let keys = |told: Vec<&String>| told.into_iter().map(String::as_str).collect::<Vec<_>>().join(" ");
+        assert_eq!((keys(told.metatiles.keys().collect()), keys(told.attributes.keys().collect())), ("2 3".to_string(), "2 3".to_string()));
+        assert_eq!((edits.tilesets.len(), told.metatiles["2"].as_slice()), (1, &[0u16; 8][..]));
+        // and another copy of the ROM is given them
+        let mut other = open(&s);
+        let applied = other.apply_edits(&Edits::from_json(&edits.to_json()).unwrap());
+        assert!(applied.skipped.is_empty(), "{family:?}: {:?}", applied.skipped);
+        other.commit();
+        assert_eq!(other.metatile_count(pair), count + 2);
+        assert!(other.collect_edits() == edits && other.rom.bytes() == game.rom.bytes(), "{family:?}");
+
+        while game.undo().is_some() {}
+        assert!(!game.modified() && game.metatile_count(pair) == count, "{family:?}: all undone");
+
+        // as many as the game gives a tileset, or as the ROM has room for
+        let error = loop {
+            match game.add_metatile(pair, None) {
+                Ok(_) => game.commit(),
+                Err(error) => break error,
+            };
+        };
+        let most = game.format.secondary_metatiles();
+        match family {
+            // 384 of 20 bytes fit in the made-up ROM's unused end; 512 of 18 don't
+            Family::FireRedLeafGreen => assert_eq!((error, game.metatile_count(pair)), (GrowError::Full { metatiles: most }, 1024)),
+            _ => assert_eq!((error, game.metatile_count(pair) < 1024), (GrowError::NoRoom, true)),
+        }
+        assert!(!game.commit(), "{family:?}: what couldn't be done changed nothing");
+
+        // a ROM with no unused end
+        let mut cramped = Game::open(s.bytes[..s.bytes.len() - FREE].to_vec(), "synth.gba", Profile::default()).unwrap();
+        assert_eq!(cramped.add_metatile(pair, None), Err(GrowError::NoRoom));
+        assert!(!cramped.commit() && !cramped.modified());
     }
 }

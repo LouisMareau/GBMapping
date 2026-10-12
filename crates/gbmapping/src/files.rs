@@ -37,8 +37,8 @@ pub enum Kind {
 impl Kind {
     fn extensions(self) -> &'static [&'static str] {
         match self {
-            Self::Any => &["gba", "json"],
-            Self::Rom => &["gba"],
+            Self::Any => &["gba", "gbc", "gb", "json"],
+            Self::Rom => &["gba", "gbc", "gb"],
             Self::Json => &["json"],
         }
     }
@@ -47,7 +47,7 @@ impl Kind {
     fn label(self) -> &'static str {
         match self {
             Self::Any => "ROMs, profiles and edits",
-            Self::Rom => "Game Boy Advance ROMs",
+            Self::Rom => "Game Boy Advance and Game Boy Color ROMs",
             Self::Json => "GBMapping edits and profiles",
         }
     }

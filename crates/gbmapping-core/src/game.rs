@@ -4,6 +4,7 @@
 //! The image the ROM was opened with is kept, so what changed can always be told.
 
 use crate::format::{block, Family, Format, ENTRIES, METATILE_BYTES};
+use crate::gbc::{self, Cartridge};
 use crate::gfx::{self, Palette, TilePixels, METATILE, TILE};
 use crate::map_names;
 use crate::profile::Profile;
@@ -173,7 +174,14 @@ impl BlockUsage {
 #[derive(Debug, PartialEq, Eq)]
 pub enum OpenError {
     Empty,
-    NoMaps { header: String, gba: bool },
+    NoMaps {
+        header: String,
+        gba: bool,
+    },
+    /// A Game Boy or Game Boy Color ROM, but not one of the games read
+    NoGameBoyMaps {
+        header: String,
+    },
 }
 
 impl fmt::Display for OpenError {
@@ -184,8 +192,10 @@ impl fmt::Display for OpenError {
                 let which = if header.is_empty() { String::new() } else { format!(" ({header})") };
                 write!(f, "No maps found in this ROM{which}. Pokémon Ruby, Sapphire, Emerald, FireRed, LeafGreen and their hacks are the games GBMapping reads.")
             }
-            Self::NoMaps { gba: false, .. } => {
-                write!(f, "This isn't a Game Boy Advance ROM (Game Boy and Game Boy Color games aren't read yet).")
+            Self::NoMaps { gba: false, .. } => write!(f, "This isn't a Game Boy Advance or a Game Boy Color ROM."),
+            Self::NoGameBoyMaps { header } => {
+                let which = if header.is_empty() { String::new() } else { format!(" ({header})") };
+                write!(f, "No maps found in this Game Boy ROM{which}. Pokémon Crystal, and the hacks that keep its maps and tilesets the way it has them, are the Game Boy Color games GBMapping reads.")
             }
         }
     }
@@ -222,6 +232,9 @@ pub struct Game {
     tiles: RefCell<HashMap<usize, Rc<Vec<u8>>>>,
     undo: Vec<Patch>,
     redo: Vec<Patch>,
+    /// The Game Boy Color ROM this was read from, when it's one: `rom` is then what the
+    /// editor made of it (see `gbc`), and saving writes the edits back into it
+    gbc: Option<Box<Cartridge>>,
 }
 
 impl Game {
@@ -229,6 +242,9 @@ impl Game {
     pub fn open(bytes: Vec<u8>, name: &str, profile: Profile) -> Result<Self, OpenError> {
         if bytes.is_empty() {
             return Err(OpenError::Empty);
+        }
+        if gbc::is_game_boy(&bytes) {
+            return Self::open_game_boy(&bytes, name, profile);
         }
         let rom = Rom::new(bytes, name);
         let header = rom.header();
@@ -274,6 +290,35 @@ impl Game {
             tiles: RefCell::new(HashMap::new()),
             undo: Vec::new(),
             redo: Vec::new(),
+            gbc: None,
+        };
+        game.maps = game.list_maps();
+        Ok(game)
+    }
+
+    /// A Game Boy Color ROM: read into an image laid out as Emerald's ROM is (see `gbc`),
+    /// which is what's drawn and edited from then on
+    fn open_game_boy(bytes: &[u8], name: &str, profile: Profile) -> Result<Self, OpenError> {
+        let Some(read) = gbc::read(bytes) else {
+            let (title, code) = gbc::title(bytes);
+            return Err(OpenError::NoGameBoyMaps { header: format!("{title} {code}").trim().to_string() });
+        };
+        let rom = Rom::new(read.image, name);
+        let family = Family::Crystal;
+        let mut game = Self {
+            original: rom.clone(),
+            rom,
+            family,
+            format: family.format(),
+            profile,
+            mapsec16: false,
+            groups: read.groups,
+            sections: None,
+            maps: Vec::new(),
+            tiles: RefCell::new(HashMap::new()),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            gbc: Some(Box::new(read.cartridge)),
         };
         game.maps = game.list_maps();
         Ok(game)
@@ -290,6 +335,7 @@ impl Game {
         let names = match self.family {
             Family::Emerald => map_names::EMERALD,
             Family::FireRedLeafGreen => map_names::FIRERED,
+            Family::Crystal => map_names::CRYSTAL,
             Family::RubySapphire => &[],
         };
         let same = names.iter().zip(&self.groups.groups).filter(|((_, maps), (_, headers))| maps.len() == headers.len()).count();
@@ -343,6 +389,9 @@ impl Game {
         if let Some(names) = &self.profile.region_names {
             return names.get(mapsec).map(str::to_string);
         }
+        if let Some(cartridge) = &self.gbc {
+            return cartridge.place(mapsec).map(str::to_string);
+        }
         self.sections?.get(&self.rom, mapsec)
     }
 
@@ -351,9 +400,38 @@ impl Game {
         self.profile.name.clone().unwrap_or_else(|| self.family.name().to_string())
     }
 
-    /// The ROM as it was opened
+    /// The ROM as it was opened (what the editor made of it then, for a Game Boy Color one)
     pub fn original(&self) -> &Rom {
         &self.original
+    }
+
+    /// The file this was opened from, as it was
+    pub fn source(&self) -> &[u8] {
+        self.gbc.as_ref().map_or(self.original.bytes(), |cartridge| cartridge.bytes())
+    }
+
+    /// The ROM with the edits, to save. A Game Boy Color game's is its own ROM with
+    /// what changed written back into it.
+    pub fn saved(&self) -> Vec<u8> {
+        match &self.gbc {
+            Some(cartridge) => cartridge.export(&self.rom, &self.original),
+            None => self.rom.bytes().to_vec(),
+        }
+    }
+
+    /// What the game's files end with
+    pub fn extension(&self) -> &'static str {
+        if self.gbc.is_some() {
+            "gbc"
+        } else {
+            "gba"
+        }
+    }
+
+    /// The palette a tile is drawn in, in the games where that goes with the tile and
+    /// not with the metatile it's in
+    pub fn tile_palette(&self, tileset: usize, tile: usize) -> Option<u8> {
+        self.gbc.as_ref()?.tile_palette(tileset, tile)
     }
 
     /// The map of this game that is `other`'s map `index`: the same map in another build
@@ -367,6 +445,21 @@ impl Game {
         if named(wanted) {
             let mut same = (0..self.maps.len()).filter(|&i| named(&self.maps[i]) && self.maps[i].name.eq_ignore_ascii_case(&wanted.name));
             if let (Some(i), None) = (same.next(), same.next()) {
+                return Some(i);
+            }
+            // a hack that brings another game's maps may name them after their region:
+            // "JohtoNewBarkTown" for "NewBarkTown". The longest name that ends the other is it.
+            let ends = |long: &str, short: &str| {
+                short.len() >= 4
+                    && long.len() > short.len()
+                    && long.is_char_boundary(long.len() - short.len())
+                    && long[long.len() - short.len()..].eq_ignore_ascii_case(short)
+            };
+            let alike =
+                |i: &usize| named(&self.maps[*i]) && (ends(&wanted.name, &self.maps[*i].name) || ends(&self.maps[*i].name, &wanted.name));
+            if let Some(i) =
+                (0..self.maps.len()).filter(alike).max_by_key(|&i| (self.maps[i].name.len().min(wanted.name.len()), std::cmp::Reverse(i)))
+            {
                 return Some(i);
             }
         }
@@ -425,9 +518,11 @@ impl Game {
         }
     }
 
-    /// The maps drawn from the same layout as this one (itself included): they change together
+    /// The maps drawn from the same layout as this one (itself included), or from the
+    /// same blocks (a Game Boy Color game's houses and gates often are): they change together
     pub fn layout_users(&self, layout: usize) -> Vec<usize> {
-        (0..self.maps.len()).filter(|&i| self.maps[i].layout.offset == layout).collect()
+        let blocks = self.maps.iter().find(|m| m.layout.offset == layout).map(|m| m.layout.blocks);
+        (0..self.maps.len()).filter(|&i| self.maps[i].layout.offset == layout || Some(self.maps[i].layout.blocks) == blocks).collect()
     }
 
     /// Does a layout's data differ from the ROM as it was opened?
@@ -528,7 +623,12 @@ impl Game {
     /// The pair's metatile ids run from 0 to this (the secondary's start after the primary's share)
     pub fn metatile_count(&self, pair: Pair) -> usize {
         let secondary = self.tileset(pair.secondary).map_or(0, |t| self.tileset_metatiles(&t, false));
-        self.format.primary_metatiles + secondary
+        // where a map has one tileset, every id is its own: as many as it holds
+        let primary = match self.format.secondary_metatiles() {
+            0 => self.tileset(pair.primary).map_or(0, |t| self.tileset_metatiles(&t, true)),
+            _ => self.format.primary_metatiles,
+        };
+        primary + secondary
     }
 
     /// The tileset a metatile id belongs to and its index there; `None` when the id holds nothing

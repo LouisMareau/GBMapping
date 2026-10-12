@@ -2,7 +2,8 @@
 //!
 //! Ruby/Sapphire and Emerald share one layout; FireRed/LeafGreen moved a few
 //! things (bigger primary tilesets, 32-bit metatile attributes, a border size
-//! in the map layout).
+//! in the map layout). The Game Boy Color games are read into Emerald's layout
+//! (see `gbc`): theirs is what that reading makes of them.
 
 /// The games an editor profile covers
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -10,6 +11,8 @@ pub enum Family {
     RubySapphire,
     Emerald,
     FireRedLeafGreen,
+    /// Game Boy Color: Crystal, and what is built like it
+    Crystal,
 }
 
 impl Family {
@@ -28,6 +31,7 @@ impl Family {
             Self::RubySapphire => "Pokémon Ruby/Sapphire",
             Self::Emerald => "Pokémon Emerald",
             Self::FireRedLeafGreen => "Pokémon FireRed/LeafGreen",
+            Self::Crystal => "Pokémon Crystal",
         }
     }
 
@@ -36,13 +40,16 @@ impl Family {
             Self::RubySapphire => &HOENN_RS,
             Self::Emerald => &HOENN_E,
             Self::FireRedLeafGreen => &KANTO,
+            Self::Crystal => &JOHTO,
         }
     }
 
-    /// A profile's name for the family ("pokeemerald", "pokefirered", "pokeruby")
+    /// A profile's name for the family ("pokeemerald", "pokefirered", "pokeruby", "pokecrystal")
     pub fn from_profile(game: &str) -> Option<Self> {
         let g = game.to_ascii_lowercase();
-        if g.contains("emerald") {
+        if g.contains("crystal") {
+            Some(Self::Crystal)
+        } else if g.contains("emerald") {
             Some(Self::Emerald)
         } else if g.contains("firered") || g.contains("leafgreen") || g.contains("frlg") {
             Some(Self::FireRedLeafGreen)
@@ -160,7 +167,38 @@ static KANTO: Format = Format {
     behaviors: crate::behaviors::FIRERED,
 };
 
+/// The Game Boy Color games as `gbc` reads them: one tileset a map, whose metatiles
+/// are its blocks' quarters (up to 256 blocks), 8 palettes, and for a metatile's
+/// behavior the collision its quarter of the block has
+static JOHTO: Format = Format {
+    family: Family::Crystal,
+    primary_metatiles: 1024,
+    total_metatiles: 1024,
+    primary_tiles: 512,
+    total_tiles: 1024,
+    primary_palettes: 8,
+    total_palettes: 8,
+    tileset_attributes: 16,
+    tileset_callback: 20,
+    attribute_size: 2,
+    layout_border_size: false,
+    behavior: AttrField { name: "Collision", mask: 0x00FF, shift: 0, values: &[] },
+    layer_type: AttrField { name: "Layer type", mask: 0xF000, shift: 12, values: LAYER_TYPES },
+    extra_fields: &[],
+    behaviors: crate::behaviors::CRYSTAL,
+};
+
 impl Format {
+    /// How many metatiles a side the game's own unit is: 2 for the Game Boy Color
+    /// games, whose blocks are four of the editor's metatiles and are painted whole
+    pub fn block_size(&self) -> usize {
+        if matches!(self.family, Family::Crystal) {
+            2
+        } else {
+            1
+        }
+    }
+
     pub fn behavior_name(&self, behavior: u32) -> Option<&'static str> {
         let i = self.behaviors.binary_search_by_key(&behavior, |&(id, _)| id as u32).ok()?;
         Some(self.behaviors[i].1)
@@ -241,7 +279,7 @@ mod tests {
 
     #[test]
     fn behavior_names_are_sorted() {
-        for f in [Family::Emerald, Family::FireRedLeafGreen] {
+        for f in [Family::Emerald, Family::FireRedLeafGreen, Family::Crystal] {
             let b = f.format().behaviors;
             assert!(!b.is_empty());
             assert!(b.windows(2).all(|w| w[0].0 < w[1].0));

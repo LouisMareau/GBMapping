@@ -1,7 +1,7 @@
 {
   "name": "GBMapping",
   "short_name": "GBMapping",
-  "description": "A map and tileset editor for Game Boy Advance ROMs",
+  "description": "A map and tileset editor for Game Boy Advance and Game Boy Color ROMs",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
@@ -13,6 +13,6 @@
     { "src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
   ],
   "file_handlers": [
-    { "action": "./", "accept": { "application/x-gba-rom": [".gba"] } }
+    { "action": "./", "accept": { "application/x-gba-rom": [".gba"], "application/x-gameboy-color-rom": [".gbc"], "application/x-gameboy-rom": [".gb"] } }
   ]
 }

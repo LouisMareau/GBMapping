@@ -2,16 +2,18 @@
 //! where a metatile's tiles and attributes are edited.
 
 use crate::app::{Settings, Tab};
-use crate::doc::{texture, Doc, LayerTextures, Stamp, PICKER_COLUMNS, TILE_COLUMNS};
+use crate::doc::{texture, Doc, LayerTextures, PICKER_COLUMNS, TILE_COLUMNS};
 use crate::map_view::{scale_for, snap};
 use egui::{pos2, vec2, Align, Color32, Mesh, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui, Vec2};
 use gbmapping_core::format::{block, AttrField};
+use gbmapping_core::gbc::block_of;
 use gbmapping_core::gfx::{TileEntry, METATILE, TILE};
 use gbmapping_core::tiles::{Borrowed, Colors};
 use gbmapping_core::{Game, Pair};
 
 const ACCENT: Color32 = Color32::from_rgb(76, 175, 80);
 const GROUND: Color32 = Color32::from_gray(17);
+const WARNING: Color32 = Color32::from_rgb(255, 202, 40);
 const WHOLE: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
 
 pub fn show(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings) {
@@ -29,16 +31,34 @@ pub fn show(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings) {
     }
 }
 
-/// "0x00D TALL_GRASS"
+const QUARTERS: [&str; 4] = ["top left", "top right", "bottom left", "bottom right"];
+
+/// "0x00D TALL_GRASS"; in a game of blocks, "block 0x1A, top left: TALL_GRASS"
 pub fn describe(game: &Game, pair: Pair, id: u16) -> String {
     if game.locate(pair, id).is_none() {
         return format!("0x{id:03X} (nothing)");
     }
     let behavior = game.behavior(pair, id);
+    if game.format.block_size() > 1 {
+        let (block, qx, qy) = block_of(id);
+        let collision = game.format.behavior_name(behavior).map_or_else(|| format!("collision 0x{behavior:02X}"), str::to_string);
+        return format!("block 0x{block:02X}, {}: {collision}", QUARTERS[qy * 2 + qx]);
+    }
     match game.format.behavior_name(behavior) {
         Some(name) => format!("0x{id:03X} {name}"),
         None => format!("0x{id:03X} behavior 0x{behavior:02X}"),
     }
+}
+
+/// What a map has on a tile, for the status line
+pub fn describe_tile(game: &Game, pair: Pair, b: u16) -> String {
+    let what = describe(game, pair, block::metatile(b));
+    // a map of blocks has no collision or elevation of its own: its tilesets hold them
+    if game.format.block_size() > 1 {
+        return what;
+    }
+    let passable = if block::collision(b) == 0 { "passable" } else { "impassable" };
+    format!("metatile {what}  ·  {passable}  ·  elevation {}", block::elevation(b))
 }
 
 fn picker(ui: &mut Ui, doc: &mut Doc, pair: Pair) {
@@ -76,9 +96,8 @@ fn picker(ui: &mut Ui, doc: &mut Doc, pair: Pair) {
             if let Some(p) = response.interact_pointer_pos().filter(|_| response.clicked()) {
                 doc.paint_border(((p.x - origin.x) / cell) as usize, ((p.y - origin.y) / cell) as usize);
             }
-            ui.label(
-                egui::RichText::new("Border: what's drawn around the map.\nClick a tile to set it from the selection.").small().weak(),
-            );
+            let how = if doc.grain() > 1 { "Click it to set it from the selection." } else { "Click a tile to set it from the selection." };
+            ui.label(egui::RichText::new(format!("Border: what's drawn around the map.\n{how}")).small().weak());
         });
     }
     ui.separator();
@@ -102,7 +121,7 @@ fn picker(ui: &mut Ui, doc: &mut Doc, pair: Pair) {
             Some(p) if response.is_pointer_button_down_on() && primary => {
                 let at = cell_at(p);
                 let start = *doc.picker_drag.get_or_insert(at);
-                doc.stamp = Stamp::from_picker(start.0, start.1, at.0, at.1);
+                doc.pick_metatiles(start, at);
             }
             _ => doc.picker_drag = None,
         }
@@ -130,27 +149,51 @@ fn tileset(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings, pair: Pair) {
         ui.weak("Pick another one in the Metatiles tab.");
         return;
     };
-    ui.label(egui::RichText::new(format!("Metatile 0x{id:03X}")).strong());
-    let in_primary = (id as usize) < format.primary_metatiles;
-    let which = if in_primary { "primary" } else { "secondary" };
-    ui.label(egui::RichText::new(format!("number {local} of the {which} tileset at 0x{:06X}", tileset.offset)).small().weak());
-    // a metatile no map shows can be rebuilt without changing any map
+    // a Game Boy Color game: the metatile is a quarter of a block, whose tiles alone are
+    // set (a tile's palette goes with the tile, and there's one layer)
+    let blocks = format.block_size() > 1;
+    let in_primary = (id as usize) < format.primary_metatiles && !blocks;
+    if blocks {
+        let (block, qx, qy) = block_of(id);
+        ui.label(egui::RichText::new(format!("Block 0x{block:02X}")).strong());
+        let quarter = QUARTERS[qy * 2 + qx];
+        ui.label(egui::RichText::new(format!("its {quarter} quarter: a block is 4×4 tiles, edited a quarter at a time")).small().weak());
+        doc.entry %= 4;
+    } else {
+        ui.label(egui::RichText::new(format!("Metatile 0x{id:03X}")).strong());
+        let which = if in_primary { "primary" } else { "secondary" };
+        ui.label(egui::RichText::new(format!("number {local} of the {which} tileset at 0x{:06X}", tileset.offset)).small().weak());
+    }
+    // what changing it changes: the maps it's on (a script may put it on others as the game runs)
     let on_maps = match doc.metatile_uses(tileset.offset, local) {
-        0 => "On no map: free to rebuild".to_string(),
+        0 => "On no map".to_string(),
         n => format!("On the maps {n} times: they change with it"),
     };
-    ui.horizontal(|ui| {
-        let next = ui.small_button("Next free").on_hover_text(
-            "The next metatile of the secondary tileset that's on no map: one to rebuild as you need, without changing any map.",
-        );
-        if next.clicked() {
-            match doc.next_free_metatile(pair, id) {
-                Some(free) => doc.select_metatile(free),
-                None => doc.notice = Some("Every metatile of this map's secondary tileset is on a map".to_string()),
+    ui.label(egui::RichText::new(on_maps).small().weak());
+    // a metatile to build without changing any map: a new one, or the copy of this one
+    let mut add: Option<Option<u16>> = None;
+    if !blocks {
+        ui.horizontal(|ui| {
+            let new = ui.small_button("New").on_hover_text(
+                "A new, empty metatile at the end of this map's secondary tileset: nothing in the game uses it yet.",
+            );
+            let duplicate = ui.small_button("Duplicate").on_hover_text(
+                "A copy of this metatile, as a new one of this map's secondary tileset.\nEdit the copy: the maps the original is on stay as they are.",
+            );
+            if new.clicked() || duplicate.clicked() {
+                add = Some(duplicate.clicked().then_some(id));
             }
-        }
-        ui.label(egui::RichText::new(on_maps).small().weak());
-    });
+            let next = ui.small_button("Next free").on_hover_text(
+                "The next metatile of the secondary tileset that's on no map, to rebuild.\nA script may still put it on a map as the game runs: a new one is used by nothing.",
+            );
+            if next.clicked() {
+                match doc.next_free_metatile(pair, id) {
+                    Some(free) => doc.select_metatile(free),
+                    None => doc.notice = Some("Every metatile of this map's secondary tileset is on a map".to_string()),
+                }
+            }
+        });
+    }
     ui.add_space(4.0);
 
     let mut entries = doc.game.entries(pair, id);
@@ -168,14 +211,15 @@ fn tileset(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings, pair: Pair) {
     }
     let layer_textures = doc.layers.as_ref().map(|l| [l.textures[0].id(), l.textures[1].id()]).unwrap_or_default();
     let big = METATILE as f32 * scale_for(4, ppp);
+    let layers: &[&str] = if blocks { &["Tiles"] } else { &["Bottom", "Top"] };
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
-            ui.label(egui::RichText::new("Both").small());
+            ui.label(egui::RichText::new(if blocks { "Quarter" } else { "Both" }).small());
             let (response, painter) = ui.allocate_painter(Vec2::splat(big), Sense::hover());
             let rect = Rect::from_min_size(snap(response.rect.min, ppp), Vec2::splat(big));
             painter.image(sheet_texture, rect, crate::doc::sheet_uv(id as usize, sheet_rows), Color32::WHITE);
         });
-        for (layer, name) in ["Bottom", "Top"].into_iter().enumerate() {
+        for (layer, &name) in layers.iter().enumerate() {
             ui.vertical(|ui| {
                 ui.label(egui::RichText::new(name).small());
                 let (response, painter) = ui.allocate_painter(Vec2::splat(big), Sense::click());
@@ -199,24 +243,33 @@ fn tileset(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings, pair: Pair) {
 
     // -- the selected quarter's tile -----------------------------------------------------
     let mut entry = TileEntry::unpack(entries[doc.entry]);
-    let quarter = ["top left", "top right", "bottom left", "bottom right"][doc.entry % 4];
-    ui.label(egui::RichText::new(format!("{} layer, {quarter}:", if doc.entry < 4 { "Bottom" } else { "Top" })).small());
+    let quarter = QUARTERS[doc.entry % 4];
+    let which = match (blocks, doc.entry < 4) {
+        (true, _) => format!("The {quarter} tile:"),
+        (false, true) => format!("Bottom layer, {quarter}:"),
+        (false, false) => format!("Top layer, {quarter}:"),
+    };
+    ui.label(egui::RichText::new(which).small());
     ui.horizontal(|ui| {
         ui.label("Tile");
-        ui.add(egui::DragValue::new(&mut entry.tile).range(0..=format.total_tiles as u16 - 1).speed(0.25));
+        let most = if blocks { 0xFF } else { format.total_tiles as u16 - 1 };
+        ui.add(egui::DragValue::new(&mut entry.tile).range(0..=most).speed(0.25));
         ui.label("Palette");
-        ui.add(egui::DragValue::new(&mut entry.palette).range(0..=15).speed(0.1));
+        ui.add_enabled(!blocks, egui::DragValue::new(&mut entry.palette).range(0..=15).speed(0.1))
+            .on_disabled_hover_text("In this game a tile's palette goes with the tile, whatever block it's in");
     });
-    ui.horizontal(|ui| {
-        ui.checkbox(&mut entry.hflip, "Flip ↔");
-        ui.checkbox(&mut entry.vflip, "Flip ↕");
-    });
+    if !blocks {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut entry.hflip, "Flip ↔");
+            ui.checkbox(&mut entry.vflip, "Flip ↕");
+        });
+    }
 
     // -- the metatile's attributes ---------------------------------------------------------
     ui.separator();
     let mut behavior = format.behavior.get(attribute);
     ui.horizontal(|ui| {
-        ui.label("Behavior");
+        ui.label(format.behavior.name);
         ui.add(egui::DragValue::new(&mut behavior).range(0..=format.behavior.max()).hexadecimal(2, false, true).speed(0.1));
         if !format.behaviors.is_empty() {
             let name = format.behavior_name(behavior).unwrap_or("(unnamed)");
@@ -228,13 +281,17 @@ fn tileset(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings, pair: Pair) {
         }
     });
     attribute = format.behavior.set(attribute, behavior);
-    for field in std::iter::once(&format.layer_type).chain(format.extra_fields) {
+    for field in std::iter::once(&format.layer_type).chain(format.extra_fields).filter(|_| !blocks) {
         attribute = field_editor(ui, field, attribute);
     }
 
     // -- the tiles: click one to put it in the selected quarter -----------------------------
     ui.separator();
     ui.horizontal(|ui| {
+        // one tileset, whose tiles have their colours: nothing to choose
+        if blocks {
+            return;
+        }
         ui.checkbox(&mut settings.usual_colors, "Usual colours").on_hover_text(
             "A tile has no colours of its own: each metatile draws it in one of the palettes.\nOn: each tile in the palette it's used with the most, and a click takes the tile with that palette.\nOff: every tile in the selected quarter's palette, to try a tile in another one.",
         );
@@ -242,10 +299,18 @@ fn tileset(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings, pair: Pair) {
             "Lists the tiles of every tileset, not only this map's two.\nA metatile can only be made of its own tilesets' tiles: a click on a tile of another tileset copies it into this map's secondary tileset, with its colours.",
         );
     });
+    // said here, where the tiles are: a click that does nothing needs its reason in sight
+    if in_primary {
+        let first = format.primary_metatiles;
+        let why = format!(
+            "Metatile 0x{id:03X} is the primary tileset's, on every map that has it: it takes that tileset's tiles only. Duplicate copies it into the secondary tileset (0x{first:03X} and up), where it takes any tile."
+        );
+        ui.label(egui::RichText::new(why).small().color(WARNING));
+    }
     let hint = if doc.tile_hint.is_empty() { "Tiles: click one to put it in the selected quarter" } else { doc.tile_hint.as_str() };
     ui.add(egui::Label::new(egui::RichText::new(hint).small()).truncate());
-    let forced = (!settings.usual_colors).then_some(entry.palette);
-    let sections = doc.tile_sections(pair, settings.all_tilesets);
+    let forced = (!settings.usual_colors && !blocks).then_some(entry.palette);
+    let sections = doc.tile_sections(pair, settings.all_tilesets && !blocks);
     let cell = TILE as f32 * scale_for(2, ppp);
     let (mut hovered, mut borrow) = (String::new(), None);
     // another metatile or another quarter: the list goes to the quarter's tile
@@ -253,7 +318,13 @@ fn tileset(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings, pair: Pair) {
     let find = doc.tiles_shown.replace(shown) != Some(shown);
     egui::ScrollArea::vertical().id_salt("tiles").auto_shrink(false).show(ui, |ui| {
         for section in sections.iter() {
-            ui.label(egui::RichText::new(&section.label).small().weak());
+            // a metatile of the primary tileset is the same on every map: it can't count on
+            // this map's secondary tiles, or on another tileset's
+            let refused = in_primary && section.base != Some(0);
+            match refused {
+                true => ui.label(egui::RichText::new(format!("{} · not for a primary metatile", section.label)).small().color(WARNING)),
+                false => ui.label(egui::RichText::new(&section.label).small().weak()),
+            };
             let rows = section.count.div_ceil(TILE_COLUMNS).max(1);
             let size = vec2(TILE_COLUMNS as f32, rows as f32) * cell;
             let (response, painter) = ui.allocate_painter(size, Sense::click());
@@ -274,7 +345,8 @@ fn tileset(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings, pair: Pair) {
             painter.rect_filled(rect, 0.0, GROUND);
             // of another tileset, the rows down to its last tile that draws something
             let drawn = rows as f32 / sheet.palettes.len().div_ceil(TILE_COLUMNS).max(1) as f32;
-            painter.image(sheet.texture.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, drawn.min(1.0))), Color32::WHITE);
+            let tint = if refused { Color32::from_white_alpha(70) } else { Color32::WHITE };
+            painter.image(sheet.texture.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, drawn.min(1.0))), tint);
             let tile_at = |p: Pos2| {
                 ((p.y - origin.y) / cell).max(0.0) as usize * TILE_COLUMNS
                     + (((p.x - origin.x) / cell).max(0.0) as usize).min(TILE_COLUMNS - 1)
@@ -282,19 +354,23 @@ fn tileset(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings, pair: Pair) {
             let palette_of = |t: usize| sheet.palettes.get(t).copied().unwrap_or(0);
             if let Some(t) = response.hover_pos().map(tile_at).filter(|&t| t < section.count) {
                 hovered = match section.base {
+                    _ if refused => "Not for a primary metatile: Duplicate it, and edit the copy".to_string(),
                     Some(base) => format!("Tile 0x{:03X} (palette {})", base as usize + t, palette_of(t)),
                     None => format!("Tile {t} there (palette {}): a click copies it into this map's tileset", palette_of(t)),
                 };
-                painter.rect_stroke(place(t), 0.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Outside);
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                if refused {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed);
+                } else {
+                    painter.rect_stroke(place(t), 0.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Outside);
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
             }
             if let Some(t) = response.interact_pointer_pos().filter(|_| response.clicked()).map(tile_at).filter(|&t| t < section.count) {
                 match section.base {
-                    // a metatile of the primary tileset is the same on every map: it can't count on this map's secondary tiles
-                    Some(base) if in_primary && base > 0 => doc.notice = Some(primary_only(id)),
+                    _ if refused => doc.notice = Some(primary_only(id)),
                     Some(base) => {
                         entry.tile = base + t as u16;
-                        if settings.usual_colors {
+                        if settings.usual_colors || blocks {
                             entry.palette = palette_of(t);
                         }
                     }
@@ -325,6 +401,9 @@ fn tileset(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings, pair: Pair) {
     }
 
     // -- into the ROM --------------------------------------------------------------------------
+    // in a game of blocks, a tile comes with its palette
+    let fixed = if blocks { doc.game.tile_palette(tileset.offset, entry.tile as usize) } else { None };
+    entry.palette = fixed.unwrap_or(entry.palette);
     entries[doc.entry] = entry.pack();
     if (entries, attribute) != before {
         doc.game.set_entries(pair, id, &entries);
@@ -335,10 +414,27 @@ fn tileset(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings, pair: Pair) {
     if !ui.input(|i| i.pointer.any_down()) {
         doc.game.commit();
     }
+    // the new metatile, once this one is as it was left: a step of its own, and the one in hand
+    if let Some(like) = add {
+        match doc.game.add_metatile(pair, like) {
+            Ok(new) => {
+                doc.game.commit();
+                doc.tileset_changed();
+                doc.select_metatile(new);
+                doc.notice = Some(match like {
+                    Some(original) => format!(
+                        "Metatile 0x{new:03X} is a copy of 0x{original:03X}, new in this map's secondary tileset: no map has it yet"
+                    ),
+                    None => format!("Metatile 0x{new:03X} is new in this map's secondary tileset: empty, and on no map yet"),
+                });
+            }
+            Err(e) => doc.notice = Some(e.to_string()),
+        }
+    }
 }
 
 fn primary_only(id: u16) -> String {
-    format!("Metatile 0x{id:03X} is in the primary tileset, which every map shares: it's made of the primary tileset's tiles only. Tiles of the other tilesets go into the secondary tileset's metatiles.")
+    format!("Metatile 0x{id:03X} is in the primary tileset, which every map shares: it's made of the primary tileset's tiles only. Duplicate it: the copy is in the secondary tileset, and takes any tile.")
 }
 
 /// What became of a tile taken in another tileset

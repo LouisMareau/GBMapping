@@ -193,6 +193,27 @@ impl Game {
                 counts[local] += 1;
             }
         }
+        // tilesets drawn from the same metatiles are on the maps together: a Game Boy Color
+        // tileset is one per set of colours its maps give it
+        let mut together: HashMap<usize, Vec<usize>> = HashMap::new();
+        for &offset in uses.keys() {
+            if let Some(t) = self.tileset(offset) {
+                together.entry(t.metatiles).or_default().push(offset);
+            }
+        }
+        for offsets in together.values().filter(|offsets| offsets.len() > 1) {
+            let mut sum: Vec<u32> = Vec::new();
+            for offset in offsets {
+                let counts = &uses[offset];
+                sum.resize(sum.len().max(counts.len()), 0);
+                for (total, count) in sum.iter_mut().zip(counts) {
+                    *total += count;
+                }
+            }
+            for &offset in offsets {
+                uses.insert(offset, sum.clone());
+            }
+        }
         uses
     }
 
@@ -240,7 +261,8 @@ impl Game {
         let data = self.tiles(offset, !secondary);
         let count = self.tileset_tile_count(pair, secondary);
         let colors = self.palettes(pair);
-        let palettes: Vec<u8> = (0..count).map(|t| palette.unwrap_or_else(|| usage.shown(offset, t)) & 0xF).collect();
+        let usual = |t: usize| self.tile_palette(offset, t).unwrap_or_else(|| usage.shown(offset, t));
+        let palettes: Vec<u8> = (0..count).map(|t| palette.unwrap_or_else(|| usual(t)) & 0xF).collect();
         let mut image = Image::new(columns * TILE, count.div_ceil(columns).max(1) * TILE);
         for (t, &p) in palettes.iter().enumerate() {
             let pixels = gfx::tile_pixels(&data, t);

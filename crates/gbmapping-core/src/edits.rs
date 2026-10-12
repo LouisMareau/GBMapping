@@ -149,13 +149,18 @@ impl Game {
                 continue;
             }
             let mut edit = TilesetEdit::default();
+            // the tileset as it was: its metatiles may have been moved since, and added to
+            let before = self.original_tileset(t.offset);
+            let had = before.map_or(0, |before| self.tileset_metatiles(&before, primary));
             for i in 0..self.tileset_metatiles(&t, primary) {
+                // a metatile the tileset didn't have is told whole
+                let then = before.filter(|_| i < had);
                 let entries = self.tileset_entries(&t, i);
-                if entries != entries_in(self.original(), &t, i) {
+                if then.is_none_or(|then| entries != entries_in(self.original(), &then, i)) {
                     edit.metatiles.insert(i.to_string(), entries.to_vec());
                 }
                 let attribute = self.tileset_attribute(&t, i);
-                if attribute != attribute_in(self.original(), self.format, &t, i) {
+                if then.is_none_or(|then| attribute != attribute_in(self.original(), self.format, &then, i)) {
                     edit.attributes.insert(i.to_string(), attribute);
                 }
             }
@@ -259,17 +264,27 @@ impl Game {
                 _ => problems.push(format!("palette {p} isn't one")),
             }
         }
-        let limit = self.format.primary_metatiles.max(self.format.secondary_metatiles());
+        // metatiles the tileset doesn't have yet: it's given them first
+        let primary = !t.secondary;
+        let wanted = e.metatiles.keys().chain(e.attributes.keys()).filter_map(|i| i.parse::<usize>().ok()).max().map_or(0, |i| i + 1);
+        let mut t = *t;
+        if wanted > self.tileset_metatiles(&t, primary) {
+            match self.grow_metatiles(&t, primary, wanted) {
+                Ok(grown) => t = grown,
+                Err(e) => problems.push(format!("its new metatiles: {e}")),
+            }
+        }
+        let count = self.tileset_metatiles(&t, primary);
         for (i, entries) in &e.metatiles {
             let (Ok(i), Ok(entries)) = (i.parse::<usize>(), <[u16; ENTRIES]>::try_from(entries.as_slice())) else { continue };
-            if i < limit {
-                self.set_tileset_entries(t, i, &entries);
+            if i < count {
+                self.set_tileset_entries(&t, i, &entries);
             }
         }
         for (i, &attribute) in &e.attributes {
             let Ok(i) = i.parse::<usize>() else { continue };
-            if i < limit {
-                self.set_tileset_attribute(t, i, attribute);
+            if i < count {
+                self.set_tileset_attribute(&t, i, attribute);
             }
         }
         problems

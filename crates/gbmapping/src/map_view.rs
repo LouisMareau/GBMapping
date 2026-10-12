@@ -2,7 +2,7 @@
 //! next to it: another map drawn the same way, only looked at and picked from.
 
 use crate::app::Settings;
-use crate::doc::{sheet_uv, Doc, Hover, Sheet, Stamp, Tool};
+use crate::doc::{sheet_uv, Doc, Hover, Sheet, Tool};
 use egui::{pos2, vec2, Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, TextureId, Ui, Vec2};
 use gbmapping_core::format::block;
 use gbmapping_core::gfx::METATILE;
@@ -108,8 +108,10 @@ fn pointer(ui: &Ui, response: &egui::Response, canvas: &Canvas, zoom: &mut u32, 
     Pointer { over: position.filter(|_| response.contains_pointer() || pressed).map(|p| canvas.tile_at(p)), pressed, primary, secondary }
 }
 
-/// The tiles in view, with the overlays that are on
-fn draw(painter: &Painter, canvas: &Canvas, map: &Map, tiles: Tiles, settings: &Settings) {
+/// The tiles in view, with the overlays that are on. `grain`: how many tiles a side the
+/// game's own unit is; the grid is of those, and only maps of single tiles have a
+/// collision and an elevation of their own to show.
+fn draw(painter: &Painter, canvas: &Canvas, map: &Map, tiles: Tiles, settings: &Settings, grain: usize) {
     let (origin, cell, width) = (canvas.origin, canvas.cell, canvas.width);
     let view = painter.clip_rect().intersect(canvas.rect());
     if view.is_negative() {
@@ -131,7 +133,7 @@ fn draw(painter: &Painter, canvas: &Canvas, map: &Map, tiles: Tiles, settings: &
             } else {
                 overlay.add_colored_rect(canvas.tile(x, y), MISSING);
             }
-            if settings.show_collision && block::collision(b) != 0 {
+            if settings.show_collision && grain == 1 && block::collision(b) != 0 {
                 overlay.add_colored_rect(canvas.tile(x, y), Color32::from_rgba_unmultiplied(229, 60, 45, 115));
             }
         }
@@ -139,7 +141,7 @@ fn draw(painter: &Painter, canvas: &Canvas, map: &Map, tiles: Tiles, settings: &
     painter.add(Shape::mesh(mesh));
     painter.add(Shape::mesh(overlay));
 
-    if settings.show_elevation {
+    if settings.show_elevation && grain == 1 {
         let font = FontId::monospace((cell * 0.45).clamp(7.0, 14.0));
         let tag = Vec2::splat((cell * 0.5).clamp(8.0, 18.0));
         for y in y0..y1 {
@@ -155,10 +157,10 @@ fn draw(painter: &Painter, canvas: &Canvas, map: &Map, tiles: Tiles, settings: &
     }
     if settings.show_grid {
         let stroke = Stroke::new(1.0, Color32::from_white_alpha(50));
-        for x in x0..=x1 {
+        for x in (x0..=x1).filter(|x| x % grain == 0) {
             painter.vline(origin.x + x as f32 * cell, view.y_range(), stroke);
         }
-        for y in y0..=y1 {
+        for y in (y0..=y1).filter(|y| y % grain == 0) {
             painter.hline(view.x_range(), origin.y + y as f32 * cell, stroke);
         }
     }
@@ -210,6 +212,9 @@ pub fn show(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings) {
     let tiles = Tiles::of(doc.sheet(&ctx, pair));
     let synced = settings.show_reference && doc.reference.is_some();
     let mut scroll = doc.scroll;
+    let grain = doc.grain();
+    // a map painted by blocks has no collision or elevation of its own to set
+    let tool = if grain > 1 && matches!(settings.tool, Tool::Collision | Tool::Elevation) { Tool::Paint } else { settings.tool };
 
     let (_, top) = scrolled(ui, "map", &mut scroll, synced, |ui| {
         // a map smaller than the view sits in its middle
@@ -219,7 +224,7 @@ pub fn show(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings) {
         let pointer = pointer(ui, &response, &canvas, &mut settings.zoom, &mut doc.zoom_wheel);
 
         match pointer.over {
-            Some(at) if pointer.pressed && pointer.primary => doc.stroke_to(at, settings.tool, settings.elevation, settings.auto_collision),
+            Some(at) if pointer.pressed && pointer.primary => doc.stroke_to(at, tool, settings.elevation, settings.auto_collision),
             _ => doc.end_stroke(),
         }
         match pointer.over {
@@ -228,9 +233,8 @@ pub fn show(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings) {
                 doc.picking = Some((doc.picking.map_or(at, |(start, _)| start), at));
             }
             _ => {
-                if let (Some((a, b)), Some(map)) = (doc.picking.take(), doc.map.as_ref()) {
-                    doc.stamp = Stamp::from_map(map, a, b);
-                    doc.scroll_picker = true;
+                if let Some((a, b)) = doc.picking.take() {
+                    doc.pick_tiles(a, b);
                 }
             }
         }
@@ -249,25 +253,28 @@ pub fn show(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings) {
             None => {}
         }
 
-        draw(&painter, &canvas, map, tiles, settings);
+        draw(&painter, &canvas, map, tiles, settings, grain);
 
         // -- what the pointer would do ----------------------------------------------
         let outline = |a: (usize, usize), b: (usize, usize)| {
             painter.rect_stroke(canvas.tiles(a, b), 0.0, Stroke::new(2.0, ACCENT), StrokeKind::Inside);
         };
         if let Some((a, b)) = doc.picking {
-            outline(a, b);
+            let (a, b) = doc.whole(a, b);
+            outline(a, (b.0.min(width - 1), b.1.min(height - 1)));
         } else if let (Some(h), None) = (doc.hover, doc.stroke.as_ref()) {
-            match settings.tool {
+            // whole units: from the corner of the one the pointer is over
+            let (x, y) = (h.x / grain * grain, h.y / grain * grain);
+            match tool {
                 Tool::Paint => {
                     // the stamp, see-through, where it would land
                     let mut ghost = Mesh::with_texture(tiles.texture);
                     for dy in 0..doc.stamp.height {
                         for dx in 0..doc.stamp.width {
                             let id = doc.stamp.cell(dx as isize, dy as isize).metatile as usize;
-                            if h.x + dx < width && h.y + dy < height && id < tiles.count {
+                            if x + dx < width && y + dy < height && id < tiles.count {
                                 ghost.add_rect_with_uv(
-                                    canvas.tile(h.x + dx, h.y + dy),
+                                    canvas.tile(x + dx, y + dy),
                                     sheet_uv(id, tiles.rows),
                                     Color32::from_white_alpha(170),
                                 );
@@ -275,9 +282,9 @@ pub fn show(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings) {
                         }
                     }
                     painter.add(Shape::mesh(ghost));
-                    outline((h.x, h.y), ((h.x + doc.stamp.width - 1).min(width - 1), (h.y + doc.stamp.height - 1).min(height - 1)));
+                    outline((x, y), ((x + doc.stamp.width - 1).min(width - 1), (y + doc.stamp.height - 1).min(height - 1)));
                 }
-                _ => outline((h.x, h.y), (h.x, h.y)),
+                _ => outline((x, y), ((x + grain - 1).min(width - 1), (y + grain - 1).min(height - 1))),
             }
         }
         if let (true, Some((true, x, y))) = (synced, doc.cursor) {
@@ -330,7 +337,7 @@ pub fn show_reference(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings) {
             None => {}
         }
 
-        draw(&painter, &canvas, map, tiles, settings);
+        draw(&painter, &canvas, map, tiles, settings, reference.game.format.block_size());
 
         if let Some((a, b)) = reference.picking {
             painter.rect_stroke(canvas.tiles(a, b), 0.0, Stroke::new(2.0, ACCENT), StrokeKind::Inside);

@@ -58,7 +58,7 @@ impl Reference {
     /// The edited ROM as it was opened: every map before the edits, and before the hack
     /// redrew it when the ROM keeps the maps' originals
     pub fn own(edited: &Game, file_name: &str) -> Option<Self> {
-        let game = Game::open(edited.original().bytes().to_vec(), file_name, edited.profile.clone()).ok()?;
+        let game = Game::open(edited.source().to_vec(), file_name, edited.profile.clone()).ok()?;
         Some(Self::new(game, file_name.to_string(), true))
     }
 
@@ -159,7 +159,7 @@ pub fn header(ui: &mut Ui, doc: &mut Doc, files: &Files) -> Option<Action> {
             }
             if ui
                 .selectable_label(false, "Another ROM…")
-                .on_hover_text("The original game, or an earlier build: its maps are shown with its own tilesets, next to yours")
+                .on_hover_text("The original game, or an earlier build: its maps are shown with its own tilesets, next to yours.\nA Game Boy Color game (.gbc) can be the reference of an Advance one: its blocks are shown as the four tiles they are.")
                 .clicked()
             {
                 files.open(Kind::Rom, Purpose::Reference);

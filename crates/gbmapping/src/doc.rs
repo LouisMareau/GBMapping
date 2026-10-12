@@ -272,7 +272,44 @@ impl Doc {
             tile_sheets: HashMap::new(),
         };
         doc.open_map(0);
+        // a game painted by blocks begins with a whole block in hand
+        if doc.grain() > 1 {
+            doc.pick_metatiles((0, 0), (0, 0));
+        }
         doc
+    }
+
+    /// How many metatiles a side the game's own unit is (see `Format::block_size`): what's
+    /// taken and painted is whole units. 1 for the Advance games; 2 for the Game Boy
+    /// Color ones, whose blocks are four metatiles.
+    pub fn grain(&self) -> usize {
+        self.game.format.block_size()
+    }
+
+    /// A rectangle of tiles, grown to whole units: its top left and bottom right corners
+    pub fn whole(&self, a: (usize, usize), b: (usize, usize)) -> ((usize, usize), (usize, usize)) {
+        let g = self.grain();
+        ((a.0.min(b.0) / g * g, a.1.min(b.1) / g * g), (a.0.max(b.0) / g * g + g - 1, a.1.max(b.1) / g * g + g - 1))
+    }
+
+    /// Takes the picker's metatiles from one corner to the other as the stamp
+    pub fn pick_metatiles(&mut self, a: (usize, usize), b: (usize, usize)) {
+        let (a, b) = self.whole(a, b);
+        self.stamp = Stamp::from_picker(a.0, a.1, b.0.min(PICKER_COLUMNS - 1), b.1);
+    }
+
+    /// Takes the map's tiles from one corner to the other as the stamp
+    pub fn pick_tiles(&mut self, a: (usize, usize), b: (usize, usize)) {
+        let (a, b) = self.whole(a, b);
+        let Some(map) = self.map.as_ref() else { return };
+        let mut stamp = Stamp::from_map(map, a, (b.0.min(map.width - 1), b.1.min(map.height - 1)));
+        // one unit: the picker shows where it is
+        if stamp.picker.is_none() && (stamp.width, stamp.height) == (self.grain(), self.grain()) {
+            let first = stamp.first() as usize;
+            stamp.picker = Some((first % PICKER_COLUMNS, first / PICKER_COLUMNS));
+        }
+        self.stamp = stamp;
+        self.scroll_picker = true;
     }
 
     pub fn open_map(&mut self, index: usize) {
@@ -338,8 +375,8 @@ impl Doc {
 
     /// Takes a metatile as the stamp, and shows it in the picker
     pub fn select_metatile(&mut self, id: u16) {
-        let (x, y) = (id as usize % PICKER_COLUMNS, id as usize / PICKER_COLUMNS);
-        self.stamp = Stamp::from_picker(x, y, x, y);
+        let at = (id as usize % PICKER_COLUMNS, id as usize / PICKER_COLUMNS);
+        self.pick_metatiles(at, at);
         self.scroll_picker = true;
     }
 
@@ -351,6 +388,14 @@ impl Doc {
         let original = self.map.as_ref().and_then(|m| game.maps.get(m.index)?.original).map(|l| l.pair());
         if let Some(made) = self.tile_sections.as_ref().filter(|made| (made.pair, made.original, made.all) == (pair, original, all)) {
             return made.list.clone();
+        }
+        // a Game Boy Color map has one tileset, whose tiles go by a byte
+        if game.format.block_size() > 1 {
+            let count = game.tileset_tile_count(pair, false).min(256);
+            let section = TileSection { label: "This map's tileset".to_string(), pair, secondary: false, count, base: Some(0) };
+            let list = Rc::new(vec![section]);
+            self.tile_sections = Some(TileSections { pair, original, all, list: list.clone() });
+            return list;
         }
         let own = |secondary: bool| TileSection {
             label: format!(
@@ -443,7 +488,9 @@ impl Doc {
     fn after_undo(&mut self, at: Option<usize>) -> bool {
         let Some(at) = at else { return false };
         if let Some(index) = self.game.map_at(at) {
-            let same_layout = self.map.as_ref().is_some_and(|m| m.layout.offset == self.game.maps[index].layout.offset);
+            // the map on screen may be another one drawn from the same blocks: it shows the change too
+            let there = self.game.maps[index].layout;
+            let same_layout = self.map.as_ref().is_some_and(|m| m.layout.offset == there.offset || m.layout.blocks == there.blocks);
             if !same_layout {
                 self.map = self.game.load_map(index);
             }
@@ -464,10 +511,18 @@ impl Doc {
     pub fn pick_from_reference(&mut self, ctx: &egui::Context, a: (usize, usize), b: (usize, usize)) {
         let Some(pair) = self.map.as_ref().map(|m| m.pair) else { return };
         self.sheet(ctx, pair);
+        let (blocks, whole) = (self.grain() > 1, self.whole(a, b));
         let Some(reference) = self.reference.as_mut() else { return };
         let Some(from) = reference.map.as_ref() else { return };
+        let same_tiles = reference.own && from.pair == pair;
+        // a map painted by blocks takes whole blocks, and only its own
+        if blocks && !same_tiles {
+            self.notice =
+                Some("This map is painted by whole blocks: only its own, as they were, can be taken from the reference".to_string());
+            return;
+        }
+        let (a, b) = if blocks { (whole.0, (whole.1 .0.min(from.width - 1), whole.1 .1.min(from.height - 1))) } else { (a, b) };
         let (from_pair, mut stamp) = (from.pair, Stamp::from_map(from, a, b));
-        let same_tiles = reference.own && from_pair == pair;
         if !same_tiles {
             reference.sheet(ctx, from_pair);
             let (Some(theirs), Some(ours)) = (reference.drawn(from_pair), self.sheets.get(&pair)) else { return };
@@ -500,6 +555,9 @@ impl Doc {
 
     /// The main button is down on the map at a tile (which may be outside it)
     pub fn stroke_to(&mut self, at: (isize, isize), tool: Tool, elevation: u8, auto: bool) {
+        // whole units are painted: the stroke goes from one's corner to another's
+        let g = self.grain() as isize;
+        let at = (at.0.div_euclid(g) * g, at.1.div_euclid(g) * g);
         let Some(map) = self.map.as_ref() else { return };
         let inside = at.0 >= 0 && at.1 >= 0 && (at.0 as usize) < map.width && (at.1 as usize) < map.height;
         let Some(stroke) = self.stroke.as_mut() else {
@@ -570,33 +628,44 @@ impl Doc {
         });
     }
 
-    /// Replaces the area of one metatile around a tile with the stamp, tiled from that tile
+    /// Replaces the area of one metatile around a tile with the stamp, tiled from that
+    /// tile. Where whole blocks are painted, the area of one block.
     fn fill(&mut self, at: (isize, isize), pair: Pair, auto: bool) {
         let Some(map) = self.map.as_ref() else { return };
-        let (w, h) = (map.width as isize, map.height as isize);
-        if at.0 < 0 || at.1 < 0 || at.0 >= w || at.1 >= h {
+        let g = self.grain() as isize;
+        let w = map.width as isize;
+        // the area is made of units: a tile, or a block of them
+        let (uw, uh) = (w / g, map.height as isize / g);
+        let start = (at.0.div_euclid(g), at.1.div_euclid(g));
+        if start.0 < 0 || start.1 < 0 || start.0 >= uw || start.1 >= uh {
             return;
         }
-        let target = block::metatile(map.blocks[(at.1 * w + at.0) as usize]);
+        let unit = |x: isize, y: isize| -> Vec<u16> {
+            (0..g * g).map(|i| block::metatile(map.blocks[((y * g + i / g) * w + x * g + i % g) as usize])).collect()
+        };
+        let target = unit(start.0, start.1);
         let stamp = self.stamp.clone();
-        let mut seen = vec![false; (w * h) as usize];
-        let mut queue = VecDeque::from([at]);
-        seen[(at.1 * w + at.0) as usize] = true;
+        let mut seen = vec![false; (uw * uh) as usize];
+        let mut queue = VecDeque::from([start]);
+        seen[(start.1 * uw + start.0) as usize] = true;
         let mut area = Vec::new();
         while let Some((x, y)) = queue.pop_front() {
             area.push((x, y));
             for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
-                if nx < 0 || ny < 0 || nx >= w || ny >= h || seen[(ny * w + nx) as usize] {
+                if nx < 0 || ny < 0 || nx >= uw || ny >= uh || seen[(ny * uw + nx) as usize] {
                     continue;
                 }
-                seen[(ny * w + nx) as usize] = true;
-                if block::metatile(map.blocks[(ny * w + nx) as usize]) == target {
+                seen[(ny * uw + nx) as usize] = true;
+                if unit(nx, ny) == target {
                     queue.push_back((nx, ny));
                 }
             }
         }
-        for (x, y) in area {
-            self.put((x, y), stamp.cell(x - at.0, y - at.1), pair, auto);
+        for (ux, uy) in area {
+            for i in 0..g * g {
+                let (x, y) = (ux * g + i % g, uy * g + i / g);
+                self.put((x, y), stamp.cell(x - start.0 * g, y - start.1 * g), pair, auto);
+            }
         }
     }
 
@@ -615,13 +684,20 @@ impl Doc {
 
     /// Sets a border tile from the stamp
     pub fn paint_border(&mut self, x: usize, y: usize) {
+        let whole = self.grain() > 1;
         let Some(map) = self.map.as_mut() else { return };
         let cell = self.stamp.cell(x as isize, y as isize);
         if cell.metatile as usize >= self.game.metatile_count(map.pair) || x >= map.border_width || y >= map.border_height {
             return;
         }
-        let i = y * map.border_width + x;
-        map.border[i] = block::with_metatile(map.border[i], cell.metatile);
+        // where blocks are painted whole, the border is one block: all of it at once
+        let across = map.border_width;
+        for (i, tile) in map.border.iter_mut().enumerate() {
+            let (bx, by) = (i % across, i / across);
+            if whole || (bx, by) == (x, y) {
+                *tile = block::with_metatile(*tile, self.stamp.cell(bx as isize, by as isize).metatile);
+            }
+        }
         self.game.store_map(map);
         if self.game.commit() {
             self.changed();

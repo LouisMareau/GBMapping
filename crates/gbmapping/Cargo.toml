@@ -1,6 +1,6 @@
 [package]
 name = "gbmapping"
-description = "A map and tileset editor for Game Boy Advance ROMs, in the browser and on the desktop"
+description = "A map and tileset editor for Game Boy Advance and Game Boy Color ROMs, in the browser and on the desktop"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true

@@ -1,9 +1,10 @@
 # GBMapping
 
-A map and tileset editor for Game Boy Advance ROMs, written in Rust. It runs in
-the browser (WebAssembly, installable as an app) and on the desktop, from the
-same code: open a ROM, paint its maps with its own tilesets, set collision and
-elevation, edit the metatiles, save the ROM or just your edits.
+A map and tileset editor for Game Boy Advance and Game Boy Color ROMs, written
+in Rust. It runs in the browser (WebAssembly, installable as an app) and on
+the desktop, from the same code: open a ROM, paint its maps with its own
+tilesets, set collision and elevation, edit the metatiles, save the ROM or
+just your edits.
 
 The ROM never leaves your computer: it's read and edited in the page.
 
@@ -20,14 +21,15 @@ and a hack all open the same way.
 | Pokémon Emerald | BPE* | checked on the English and French games, and on a build of pokeemerald with 1182 maps |
 | Pokémon Ruby, Sapphire | AXV*, AXP* | same data layout as Emerald; not yet tried on a ROM |
 | Pokémon FireRed, LeafGreen | BPR*, BPG* | their own layout (640 primary metatiles, 32-bit attributes, sized borders), written from pokefirered and checked on made-up ROMs only; not yet tried on a real one |
+| Pokémon Crystal (Game Boy Color) | BYT* | [its blocks as four tiles each](#game-boy-color-games); checked on the French game. Gold and Silver are laid out much the same and not yet tried. A hack that stores its maps another way (Polished Crystal compresses them) isn't read. |
 
 Not there yet: drawing tiles and choosing colours (tiles are copied from one
-tileset to another, not drawn), more metatiles than a tileset has, map sizes,
-events and connections, metatiles of three layers, the Game Boy Color games.
+tileset to another, not drawn), map sizes, events and connections, metatiles
+of three layers, the first Game Boy's games.
 
 ## Using it
 
-- **Open…** a `.gba`, or drop it anywhere on the window. The maps are listed
+- **Open…** a `.gba` or a `.gbc`, or drop it anywhere on the window. The maps are listed
   by group; type in the search box to find one by name, place or number.
 - **Paint** (`P`): pick a metatile in the **Metatiles** tab, or drag there to
   take a rectangle of them, then paint. Right-click the map to pick what's
@@ -73,11 +75,15 @@ shown in both.
   the original game, or an earlier build of yours. Its maps are drawn with
   its own tilesets. That's for maps redrawn with other tiles, a region
   brought into a hack and converted to that hack's tilesets for instance: the
-  original on one side, the conversion to polish on the other.
+  original on one side, the conversion to polish on the other. It can be a
+  game of the other console: Crystal's `.gbc` next to the Advance hack that
+  has Johto in it. A Game Boy Color block being four tiles, its maps lie tile
+  for tile next to the ones made of them.
 - **Follow** keeps the reference on the map that goes with the one being
-  edited: the map of the same name, else the map of the same place and size
-  (the names are those the ROM can tell). When that isn't the right one,
-  choose the map in the list next to it.
+  edited: the map of the same name (or of that name after a region's, a hack
+  calling `JohtoNewBarkTown` the `NewBarkTown` it brought), else the map of
+  the same place and size (the names are those the ROM can tell). When that
+  isn't the right one, choose the map in the list next to it.
 - Picking in an original, or in another ROM's reference, can't give its
   tiles: the map being edited isn't on those tilesets. Each is replaced by
   the **closest-looking metatile** of the edited map's tilesets, with the
@@ -112,14 +118,62 @@ A metatile is eight tiles, each drawn in one of the map's palettes. The
   step to undo, and goes in the saved ROM and in the edits file. When the
   tileset's tiles no longer fit where they were, they're written to free space
   at the end of the ROM.
+- **New** adds an empty metatile at the end of the map's secondary tileset,
+  and **Duplicate** adds the copy of the selected one there (its tiles, its
+  behavior): a metatile to build without changing any map, since nothing in
+  the game uses it yet. A copy is how to rework a metatile for one place and
+  leave the maps the original is on as they are, and how a primary tileset's
+  metatile gets tiles of the secondary one. A metatile is 16×16 pixels, two
+  layers of 2×2 tiles: the game sets that, and bigger things are several
+  metatiles (drag in the picker, or right-drag on a map, to take them
+  together). What can grow is how many a tileset has: up to 512 for a
+  secondary tileset in Emerald (the ids `0x200` to `0x3FF`), 384 in FireRed.
+  The first new one moves the tileset's metatiles to free space at the end of
+  the ROM, where they then grow.
 - **Next free** goes to the next metatile of the secondary tileset that no map
-  shows: one to rebuild without changing any map. The line next to it tells
-  how many times the selected metatile is on the maps.
+  shows, for when the tileset has all it can. A script may still put such a
+  metatile on a map as the game runs (a door that opens, a tree that's cut):
+  a new one is the safe choice. The line over the buttons tells how many
+  times the selected metatile is on the maps.
 
 The limits: a secondary tileset holds a fixed number of tiles (the status bar
 says when it's full); the tiles must be compressed in the ROM, as the games' are;
-a metatile of the primary tileset, which every map shares, only takes the
-primary tileset's tiles.
+a metatile of the primary tileset (below `0x200` in Emerald), which every map
+shares, only takes the primary tileset's tiles: the tab says so when one is
+selected, and dims the tiles it can't take. The secondary tileset's metatiles
+take any.
+
+### Game Boy Color games
+
+Crystal draws its maps with **blocks** of 4×4 tiles, 32 pixels a side, where
+the Advance games have metatiles of 2×2. The editor shows a block as the four
+metatiles it is (its quarters), so a map is twice as wide and as high as it
+has blocks, and everything above works the same, with these differences:
+
+- **Blocks are painted whole.** The picker shows them four to a row; a click
+  or a drag takes whole blocks, on the map too, and Fill replaces an area of
+  one block.
+- Maps have no collision or elevation of their own: a block's **collision**
+  is in its tileset, one per quarter. The Tileset tab names them (`FLOOR`,
+  `WALL`, `TALL_GRASS`, `DOOR`…) and sets them.
+- The **Tileset** tab edits a block a quarter at a time: click one of its
+  four tiles, then a tile of the tileset. A tile comes with its palette (the
+  game keeps one per tile, not per block), and there are no flips and no
+  second layer.
+- A map has one tileset, drawn in **its own colours**: its environment's
+  (outdoors, indoors, cave), by day (by night for the maps the game always
+  shows so), with its town's roofs. One tileset of the ROM is listed once per
+  set of colours its maps give it.
+- The ROM draws many houses, gates and Pokémon Centers from the **same
+  blocks**: painting one paints them all, and the editor says how many maps
+  share them.
+- **Save ROM** gives the `.gbc` with the blocks, tiles and collisions that
+  changed written back, and its checksum set right. Nothing else in it is
+  touched: saved without an edit, it's the file that was opened, byte for
+  byte.
+
+Tile pictures and palettes aren't edited, and a tileset keeps the blocks it
+has.
 
 ### As an app
 
@@ -185,6 +239,17 @@ by ROM address, metatiles by their number in the tileset. A block is
 `metatile | collision << 10 | elevation << 12`; a metatile is eight
 `tile | hflip << 10 | vflip << 11 | palette << 12`.
 
+A Game Boy Color game's edits are told in the editor's terms: a map twice as
+wide and as high as it has blocks, each of its tiles the quarter of a block,
+`((block / 4) * 2 + y) * 8 + (block % 4) * 2 + x` for the quarter at `x`, `y`
+(0 or 1). Its tilesets go by where the editor put them, which is the same
+each time that ROM is opened: such a file is for that ROM.
+
+A metatile numbered past the tileset's last one is a new one: applying the
+file gives the tileset the metatiles up to it. What rebuilds a game from its
+sources has to add them to the tileset's metatiles and attributes the same
+way.
+
 `tiles` and `palettes` are only there when tiles were brought from another
 tileset: a tile's 32 bytes (4 bits a pixel, as the ROM has them once
 unpacked) in hexadecimal, by its number in the tileset, and a palette's 16
@@ -212,7 +277,7 @@ runs the desktop program.
 
 | | |
 | --- | --- |
-| `crates/gbmapping-core` | the ROM: finding the tables, reading maps and tilesets, drawing, editing, undo, edits files. No UI, no I/O. |
+| `crates/gbmapping-core` | the ROM: finding the tables, reading maps and tilesets, drawing, editing, undo, edits files; `gbc` reads a Game Boy Color ROM into the same model and writes the edits back. No UI, no I/O. |
 | `crates/gbmapping` | the editor, with [egui](https://github.com/emilk/egui); its page, manifest and service worker for the web |
 | `tools/` | generators (behavior names, map names, icons) and the browser check |
 
@@ -225,10 +290,12 @@ cargo test -p gbmapping-core
 runs the core's tests on made-up ROMs. Real ones can't be in the repository;
 name yours and they're opened, drawn and edited too. A ROM's profile goes
 after it, behind a `|`: every original it tells is then read and checked
-(its own tilesets, every metatile it uses, the map's size):
+(its own tilesets, every metatile it uses, the map's size). A `.gbc` has its
+own check: read, drawn in colours, saved as it was opened, then with a block
+painted:
 
 ```bash
-GBMAPPING_TEST_ROMS="emerald.gba;my-hack.gba|my-hack.json" cargo test -p gbmapping-core --test roms -- --nocapture
+GBMAPPING_TEST_ROMS="emerald.gba;my-hack.gba|my-hack.json;crystal.gbc" cargo test -p gbmapping-core --test roms -- --nocapture
 ```
 
 `cargo run -p gbmapping-core --example inspect -- game.gba 0.9 map.png` lists
@@ -236,7 +303,7 @@ a ROM's maps and draws one, without the editor (`original` before the
 picture's name draws the map's original).
 
 ```bash
-node tools/browser/check.mjs game.gba [profile.json]
+node tools/browser/check.mjs game.gba [profile.json] [reference.gbc [map]]
 ```
 
 checks the built site in a headless Chrome, end to end: a ROM in through the
@@ -245,7 +312,10 @@ exported edits compared with what they should be, tiles taken back from the
 reference, a map's original shown on its own tilesets when the profile tells
 one, a tile of another tileset put in a metatile and undone, the edits kept
 across a reload, the app installable and working offline. Screenshots land in
-`target/browser-check/`.
+`target/browser-check/`. A second ROM is opened as the reference of the first,
+with the first's map `map` on screen: Crystal next to the hack that has its
+maps, `JohtoNewBarkTown` for instance. A `.gbc` given first is checked on its
+own: a block picked, painted, undone, and the saved ROM compared.
 
 ### Publishing
 

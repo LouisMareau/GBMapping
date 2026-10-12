@@ -6,7 +6,6 @@ use crate::files::{Files, Incoming, Kind, Purpose};
 use crate::reference::{self, Reference};
 use crate::{map_view, side};
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText, Ui};
-use gbmapping_core::format::block;
 use gbmapping_core::{Edits, Game, Profile};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -233,7 +232,7 @@ impl App {
         doc.end_stroke();
         let edits = doc.game.collect_edits();
         let map = doc.map.as_ref().map(|m| m.id);
-        match Game::open(doc.game.original().bytes().to_vec(), &doc.file_name, self.profile.clone()) {
+        match Game::open(doc.game.source().to_vec(), &doc.file_name, self.profile.clone()) {
             Ok(mut game) => {
                 game.apply_edits(&edits);
                 game.commit();
@@ -278,8 +277,9 @@ impl App {
         let Some(doc) = self.doc.as_mut() else { return };
         doc.end_stroke();
         let stem = doc.file_name.rsplit_once('.').map_or(doc.file_name.as_str(), |(stem, _)| stem);
-        let name = if stem.ends_with("-edited") { format!("{stem}.gba") } else { format!("{stem}-edited.gba") };
-        let saved = self.files.save(&name, Kind::Rom, doc.game.rom.bytes());
+        let extension = doc.game.extension();
+        let name = if stem.ends_with("-edited") { format!("{stem}.{extension}") } else { format!("{stem}-edited.{extension}") };
+        let saved = self.files.save(&name, Kind::Rom, &doc.game.saved());
         self.saved("The ROM", saved);
     }
 
@@ -393,7 +393,7 @@ impl App {
             ui.spacing_mut().item_spacing.y = 6.0;
             ui.label(RichText::new("GBMapping").strong());
             ui.separator();
-            if ui.button("Open…").on_hover_text("A ROM (.gba), a profile or an edits file (.json). Dropping them on the window works too.").clicked() {
+            if ui.button("Open…").on_hover_text("A ROM (.gba, .gbc), a profile or an edits file (.json). Dropping them on the window works too.").clicked() {
                 self.files.open(Kind::Any, Purpose::Open);
             }
             let open = self.doc.is_some();
@@ -420,11 +420,20 @@ impl App {
                 self.redo();
             }
             ui.separator();
+            // a game painted by blocks keeps its collisions in its tilesets: a map has none to set
+            let blocks = self.doc.as_ref().is_some_and(|d| d.grain() > 1);
             let s = &mut self.settings;
             for tool in Tool::ALL {
-                ui.selectable_value(&mut s.tool, tool, tool.label()).on_hover_text(tool.hint());
+                if blocks && matches!(tool, Tool::Collision | Tool::Elevation) {
+                    continue;
+                }
+                let selected = s.tool == tool || (blocks && tool == Tool::Paint && matches!(s.tool, Tool::Collision | Tool::Elevation));
+                if ui.selectable_label(selected, tool.label()).on_hover_text(tool.hint()).clicked() {
+                    s.tool = tool;
+                }
             }
             match s.tool {
+                _ if blocks => {}
                 Tool::Elevation => {
                     ui.add(egui::DragValue::new(&mut s.elevation).range(0..=15).speed(0.1).prefix("level ")).on_hover_text("The elevation to set: 3 is the usual ground, 1 is water, 0 and 15 connect levels");
                 }
@@ -446,8 +455,10 @@ impl App {
             }
             ui.separator();
             ui.checkbox(&mut s.show_grid, "Grid").on_hover_text("G");
-            ui.checkbox(&mut s.show_collision, "Collision").on_hover_text("C: impassable tiles in red");
-            ui.checkbox(&mut s.show_elevation, "Elevation").on_hover_text("E: each tile's elevation");
+            if !blocks {
+                ui.checkbox(&mut s.show_collision, "Collision").on_hover_text("C: impassable tiles in red");
+                ui.checkbox(&mut s.show_elevation, "Elevation").on_hover_text("E: each tile's elevation");
+            }
             ui.separator();
             ui.checkbox(&mut s.show_reference, "Reference").on_hover_text(
                 "R: a second, read-only view next to the map. It shows this ROM as it was opened, or another ROM (the original game, an earlier build): the model to work from.",
@@ -515,10 +526,13 @@ impl App {
                                 ui.label(section);
                             }
                             ui.label(format!("Map {} · {}×{} tiles", m.id, m.layout.width, m.layout.height));
-                            ui.label(format!("Tilesets 0x{:06X} + 0x{:06X}", m.layout.primary, m.layout.secondary));
+                            match doc.game.format.block_size() {
+                                1 => ui.label(format!("Tilesets 0x{:06X} + 0x{:06X}", m.layout.primary, m.layout.secondary)),
+                                n => ui.label(format!("{}×{} blocks", m.layout.width / n, m.layout.height / n)),
+                            };
                             let shared = doc.game.layout_users(m.layout.offset).len();
                             if shared > 1 {
-                                ui.label(format!("Drawn from a layout {shared} maps share: they change together"));
+                                ui.label(format!("Drawn from {} {shared} maps share: they change together", shared_data(&doc.game).0));
                             }
                         });
                     }
@@ -547,29 +561,13 @@ impl App {
             let text = match doc.hover {
                 _ if over_reference.is_some() => {
                     let Some((reference, shown, h)) = over_reference else { return };
-                    let passable = if block::collision(h.block) == 0 { "passable" } else { "impassable" };
-                    format!(
-                        "Reference ({}, {})  ·  metatile {}  ·  {passable}  ·  elevation {}",
-                        h.x,
-                        h.y,
-                        side::describe(&reference.game, shown.pair, block::metatile(h.block)),
-                        block::elevation(h.block)
-                    )
+                    format!("Reference ({}, {})  ·  {}", h.x, h.y, side::describe_tile(&reference.game, shown.pair, h.block))
                 }
-                Some(h) => {
-                    let id = block::metatile(h.block);
-                    let passable = if block::collision(h.block) == 0 { "passable" } else { "impassable" };
-                    format!(
-                        "({}, {})  ·  metatile {}  ·  {passable}  ·  elevation {}",
-                        h.x,
-                        h.y,
-                        side::describe(&doc.game, map.pair, id),
-                        block::elevation(h.block)
-                    )
-                }
+                Some(h) => format!("({}, {})  ·  {}", h.x, h.y, side::describe_tile(&doc.game, map.pair, h.block)),
                 None => {
                     let shared = doc.game.layout_users(map.layout.offset).len();
-                    let shared = if shared > 1 { format!("  ·  layout shared by {shared} maps") } else { String::new() };
+                    let shared =
+                        if shared > 1 { format!("  ·  {} shared by {shared} maps", shared_data(&doc.game).1) } else { String::new() };
                     format!("{}  ·  map {}  ·  {}×{}  ·  {}{shared}", map.name, map.id, map.width, map.height, doc.game.name())
                 }
             };
@@ -612,15 +610,15 @@ impl App {
         ui.vertical_centered(|ui| {
             ui.add_space((ui.available_height() * 0.22).max(16.0));
             ui.heading("GBMapping");
-            ui.label("A map and tileset editor for Game Boy Advance ROMs");
+            ui.label("A map and tileset editor for Game Boy Advance and Game Boy Color ROMs");
             ui.add_space(16.0);
             if ui.add(egui::Button::new(RichText::new("  Open a ROM…  ").size(18.0))).clicked() {
                 self.files.open(Kind::Any, Purpose::Open);
             }
             ui.add_space(6.0);
-            ui.label("or drop a .gba anywhere on this window");
+            ui.label("or drop a .gba or a .gbc anywhere on this window");
             ui.add_space(20.0);
-            ui.weak("Pokémon Ruby, Sapphire, Emerald, FireRed and LeafGreen: the original games,");
+            ui.weak("Pokémon Ruby, Sapphire, Emerald, FireRed, LeafGreen and Crystal: the original games,");
             ui.weak("builds of their decompilations, and hacks. The maps are found in the ROM itself.");
             ui.add_space(10.0);
             ui.weak("Your ROM stays on your computer: it's read and edited here, and never sent anywhere.");
@@ -695,10 +693,20 @@ fn map_header(ui: &mut Ui, doc: &Doc) {
     let name = format!("{}  ({})", map.name, map.id);
     painter.text(egui::pos2(title.right() + 8.0, first.y), egui::Align2::LEFT_CENTER, name, font.clone(), ui.visuals().text_color());
     let shared = doc.game.layout_users(map.layout.offset).len();
-    let shared = if shared > 1 { format!("  ·  layout shared by {shared} maps") } else { String::new() };
+    let shared = if shared > 1 { format!("  ·  {} shared by {shared} maps", shared_data(&doc.game).1) } else { String::new() };
     let second = first + egui::vec2(0.0, row + ui.spacing().item_spacing.y);
     let details = format!("{}×{} tiles{shared}", map.width, map.height);
     painter.text(second, egui::Align2::LEFT_CENTER, details, font, ui.visuals().weak_text_color());
+}
+
+/// What several maps are drawn from in a game: "a layout" in the Advance games; in the
+/// Game Boy Color ones, which have no such thing, the same blocks
+fn shared_data(game: &Game) -> (&'static str, &'static str) {
+    if game.format.block_size() > 1 {
+        ("blocks", "blocks")
+    } else {
+        ("a layout", "layout")
+    }
 }
 
 /// Where a ROM's edits are kept: by game code, title and size (the key the first,
