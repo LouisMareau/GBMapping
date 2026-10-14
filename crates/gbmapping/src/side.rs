@@ -25,6 +25,8 @@ pub fn show(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings) {
         // a game whose tiles' pictures aren't written back has nothing to draw on
         if doc.grain() == 1 {
             ui.selectable_value(&mut settings.tab, Tab::Draw, "Draw").on_hover_text("Draw on the selected metatile, a pixel at a time");
+            ui.selectable_value(&mut settings.tab, Tab::Anim, "Anim")
+                .on_hover_text("The animations of the tiles (doors that open, water, flowers): see and draw on their frames");
         }
     });
     ui.separator();
@@ -32,7 +34,8 @@ pub fn show(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings) {
     match settings.tab {
         Tab::Metatiles => picker(ui, doc, pair),
         Tab::Draw if doc.grain() == 1 => crate::draw::show(ui, doc, settings, pair),
-        Tab::Tileset | Tab::Draw => tileset(ui, doc, settings, pair),
+        Tab::Anim if doc.grain() == 1 => crate::anim::show(ui, doc, pair),
+        Tab::Tileset | Tab::Draw | Tab::Anim => tileset(ui, doc, settings, pair),
     }
 }
 

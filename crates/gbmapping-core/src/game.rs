@@ -237,6 +237,14 @@ pub struct Game {
     gbc: Option<Box<Cartridge>>,
     /// The tilesets made here as copies, and what each is the copy of
     pub(crate) copies: HashMap<usize, usize>,
+    /// The tiles of animations' frames that were drawn on: where they are in the ROM
+    pub(crate) drawn_graphics: BTreeSet<usize>,
+    /// The scripts the editor wrote (texts said), by address
+    pub(crate) made_scripts: std::collections::BTreeMap<u32, crate::events::MadeScript>,
+    /// Where the ROM's free end began when it was opened
+    pub(crate) opened_free: std::cell::OnceCell<usize>,
+    /// Object events tell their sprite on 16 bits (see `objects_wide`)
+    pub(crate) wide_objects: std::cell::OnceCell<bool>,
 }
 
 impl Game {
@@ -294,6 +302,10 @@ impl Game {
             redo: Vec::new(),
             gbc: None,
             copies: HashMap::new(),
+            drawn_graphics: BTreeSet::new(),
+            made_scripts: Default::default(),
+            opened_free: Default::default(),
+            wide_objects: Default::default(),
         };
         game.maps = game.list_maps();
         Ok(game)
@@ -323,6 +335,10 @@ impl Game {
             redo: Vec::new(),
             gbc: Some(Box::new(read.cartridge)),
             copies: HashMap::new(),
+            drawn_graphics: BTreeSet::new(),
+            made_scripts: Default::default(),
+            opened_free: Default::default(),
+            wide_objects: Default::default(),
         };
         game.maps = game.list_maps();
         Ok(game)

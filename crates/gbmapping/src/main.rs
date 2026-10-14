@@ -4,9 +4,11 @@
 // No console window behind the desktop app on Windows
 #![cfg_attr(all(not(debug_assertions), not(target_arch = "wasm32")), windows_subsystem = "windows")]
 
+mod anim;
 mod app;
 mod doc;
 mod draw;
+mod events;
 mod files;
 mod map_view;
 mod reference;

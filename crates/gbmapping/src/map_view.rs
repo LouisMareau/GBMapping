@@ -3,7 +3,9 @@
 
 use crate::app::Settings;
 use crate::doc::{sheet_uv, Doc, Hover, Sheet, Tool};
+use crate::events;
 use egui::{pos2, vec2, Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, TextureId, Ui, Vec2};
+use gbmapping_core::events::List;
 use gbmapping_core::format::block;
 use gbmapping_core::gfx::METATILE;
 use gbmapping_core::Map;
@@ -210,11 +212,14 @@ pub fn show(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings) {
     let size = vec2(width as f32, height as f32) * cell;
     let ctx = ui.ctx().clone();
     let tiles = Tiles::of(doc.sheet(&ctx, pair));
-    let synced = settings.show_reference && doc.reference.is_some();
-    let mut scroll = doc.scroll;
     let grain = doc.grain();
-    // a map painted by blocks has no collision or elevation of its own to set
-    let tool = if grain > 1 && matches!(settings.tool, Tool::Collision | Tool::Elevation) { Tool::Paint } else { settings.tool };
+    // a map painted by blocks has no collision or elevation of its own to set (nor events read yet)
+    let tool =
+        if grain > 1 && matches!(settings.tool, Tool::Collision | Tool::Elevation | Tool::Events) { Tool::Paint } else { settings.tool };
+    // in the Events mode, the events' panel is where the reference is
+    let synced = settings.show_reference && doc.reference.is_some() && tool != Tool::Events;
+    let mut scroll = doc.scroll;
+    let mut go_to = None;
 
     let (_, top) = scrolled(ui, "map", &mut scroll, synced, |ui| {
         // a map smaller than the view sits in its middle
@@ -223,12 +228,16 @@ pub fn show(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings) {
         let canvas = Canvas { origin: snap(response.rect.min + margin, ppp), cell, width, height };
         let pointer = pointer(ui, &response, &canvas, &mut settings.zoom, &mut doc.zoom_wheel);
 
-        match pointer.over {
-            Some(at) if pointer.pressed && pointer.primary => doc.stroke_to(at, tool, settings.elevation, settings.auto_collision),
-            _ => doc.end_stroke(),
+        if tool == Tool::Events {
+            go_to = events_pointer(&response, &canvas, &pointer, doc);
+        } else {
+            match pointer.over {
+                Some(at) if pointer.pressed && pointer.primary => doc.stroke_to(at, tool, settings.elevation, settings.auto_collision),
+                _ => doc.end_stroke(),
+            }
         }
         match pointer.over {
-            Some(at) if pointer.pressed && pointer.secondary => {
+            Some(at) if pointer.pressed && pointer.secondary && tool != Tool::Events => {
                 let at = canvas.clamped(at);
                 doc.picking = Some((doc.picking.map_or(at, |(start, _)| start), at));
             }
@@ -254,6 +263,10 @@ pub fn show(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings) {
         }
 
         draw(&painter, &canvas, map, tiles, settings, grain);
+        if tool == Tool::Events {
+            draw_events(&painter, &canvas, doc, &ctx);
+            return;
+        }
 
         // -- what the pointer would do ----------------------------------------------
         let outline = |a: (usize, usize), b: (usize, usize)| {
@@ -293,6 +306,133 @@ pub fn show(ui: &mut Ui, doc: &mut Doc, settings: &mut Settings) {
     });
     doc.scroll = scroll;
     doc.map_top = top;
+    // a warp double-clicked: its map, its warp selected
+    if let Some((index, warp)) = go_to {
+        doc.open_map(index);
+        if doc.events().is_some_and(|e| warp < e.warps.len()) {
+            doc.events.selected = Some((List::Warps, warp));
+        }
+    }
+}
+
+/// The Events mode's pointer: a press picks the event under it (or the tile for a new
+/// one), a drag moves the event picked, a click on the one picked picks the next on its
+/// tile, a double-click on a warp asks to go where it leads (the map and its warp, returned)
+fn events_pointer(response: &egui::Response, canvas: &Canvas, pointer: &Pointer, doc: &mut Doc) -> Option<(usize, usize)> {
+    let events = doc.events()?.clone();
+    let tile = pointer.over.filter(|&c| canvas.holds(c)).map(|(x, y)| (x as i16, y as i16));
+    match (pointer.pressed && pointer.primary, doc.events.dragging) {
+        // a press begins: what's there is picked, the one picked already if it's there
+        (true, None) => {
+            let (x, y) = tile?;
+            let here = events.at(x, y);
+            doc.events.pressed_on = doc.events.selected.filter(|s| here.contains(s));
+            let picked = doc.events.pressed_on.or(here.first().copied());
+            doc.events.selected = picked;
+            if picked.is_none() {
+                doc.events.add_at = Some((x, y));
+            }
+            doc.events.dragging = Some(false);
+        }
+        // held: the event picked follows the pointer, a tile at a time
+        (true, Some(_)) => {
+            let ((x, y), (list, i)) = (tile?, doc.events.selected?);
+            if events.place(list, i) != Some((x, y)) {
+                let mut moved = events.clone();
+                moved.move_to(list, i, x, y);
+                doc.write_events(moved);
+                doc.events.dragging = Some(true);
+            }
+        }
+        (false, Some(moved)) => {
+            doc.events.dragging = None;
+            // a click on the one picked already: the next one on its tile
+            if let (false, Some(was), Some((x, y))) = (moved, doc.events.pressed_on.take(), tile) {
+                let here = events.at(x, y);
+                if let Some(k) = here.iter().position(|&s| s == was).filter(|_| here.len() > 1) {
+                    doc.events.selected = Some(here[(k + 1) % here.len()]);
+                }
+            }
+            doc.commit_events(false);
+        }
+        (false, None) => {}
+    }
+    match doc.events.selected {
+        Some((List::Warps, i)) if response.double_clicked() => {
+            let w = events.warps.get(i)?;
+            let index = doc.game.map_index(gbmapping_core::MapId { group: w.group, num: w.num })?;
+            Some((index, w.warp as usize))
+        }
+        _ => None,
+    }
+}
+
+/// The map's events over it: people as the game draws them (their feet on their tile),
+/// the rest as tinted tiles marked with a letter; the one picked outlined
+fn draw_events(painter: &Painter, canvas: &Canvas, doc: &mut Doc, ctx: &egui::Context) {
+    let Some(events) = doc.events().cloned() else { return };
+    let cell = canvas.cell;
+    let inside = |(x, y): (i16, i16)| x >= 0 && y >= 0 && (x as usize) < canvas.width && (y as usize) < canvas.height;
+    let font = FontId::proportional((cell * 0.45).clamp(8.0, 15.0));
+    let mark = |list: List, i: usize, rect: Rect| {
+        let color = events::color(list, &events, i);
+        painter.rect_filled(rect.shrink(1.0), 2.0, color.gamma_multiply(0.45));
+        painter.rect_stroke(rect.shrink(1.0), 2.0, Stroke::new(1.5, color), StrokeKind::Inside);
+        if cell >= 12.0 {
+            painter.text(
+                rect.left_top() + vec2(3.0, 1.0),
+                Align2::LEFT_TOP,
+                events::letter(list, &events, i),
+                font.clone(),
+                Color32::WHITE,
+            );
+        }
+    };
+    for list in [List::Warps, List::Triggers, List::Signs] {
+        for i in 0..events.len(list) {
+            let Some(place) = events.place(list, i).filter(|&p| inside(p)) else { continue };
+            mark(list, i, canvas.tile(place.0 as usize, place.1 as usize));
+        }
+    }
+    // the people, those further down over those further up
+    let mut people: Vec<usize> = (0..events.objects.len()).collect();
+    people.sort_by_key(|&i| events.objects[i].y);
+    let scale = cell / METATILE as f32;
+    let mut outlines = Vec::new();
+    for i in people {
+        let o = &events.objects[i];
+        if !inside((o.x, o.y)) {
+            continue;
+        }
+        let rect = canvas.tile(o.x as usize, o.y as usize);
+        painter.rect_stroke(rect.shrink(1.0), 2.0, Stroke::new(1.0, events::OBJECT.gamma_multiply(0.7)), StrokeKind::Inside);
+        match doc.sprite(ctx, o.graphics) {
+            Some((texture, size)) => {
+                let size = size * scale;
+                let at = Rect::from_min_size(pos2(rect.center().x - size.x / 2.0, rect.max.y - size.y), size);
+                painter.image(texture, at, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                outlines.push((i, at));
+            }
+            None => mark(List::Objects, i, rect),
+        }
+    }
+    // the one picked, and where a new one would go
+    if let Some((list, i)) = doc.events.selected {
+        if let Some(place) = events.place(list, i).filter(|&p| inside(p)) {
+            let rect = canvas.tile(place.0 as usize, place.1 as usize);
+            painter.rect_stroke(rect, 0.0, Stroke::new(3.0, Color32::from_black_alpha(170)), StrokeKind::Outside);
+            painter.rect_stroke(rect, 0.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Outside);
+            if let Some((_, sprite)) = outlines.iter().find(|(o, _)| list == List::Objects && *o == i) {
+                painter.rect_stroke(*sprite, 0.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Outside);
+            }
+        }
+    } else if let Some(place) = doc.events.add_at.filter(|&p| inside(p)) {
+        let rect = canvas.tile(place.0 as usize, place.1 as usize);
+        painter.rect_stroke(rect, 0.0, Stroke::new(1.5, Color32::from_white_alpha(160)), StrokeKind::Inside);
+    }
+    if let Some(h) = doc.hover {
+        painter.rect_stroke(canvas.tile(h.x, h.y), 0.0, Stroke::new(1.0, Color32::from_white_alpha(120)), StrokeKind::Inside);
+    }
 }
 
 /// The reference's map: the same view of another map, read-only. A right-click or a

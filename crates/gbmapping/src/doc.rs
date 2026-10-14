@@ -23,10 +23,12 @@ pub enum Tool {
     Fill,
     Collision,
     Elevation,
+    /// The map's events are shown and edited; nothing is painted
+    Events,
 }
 
 impl Tool {
-    pub const ALL: [Self; 4] = [Self::Paint, Self::Fill, Self::Collision, Self::Elevation];
+    pub const ALL: [Self; 5] = [Self::Paint, Self::Fill, Self::Collision, Self::Elevation, Self::Events];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -34,6 +36,7 @@ impl Tool {
             Self::Fill => "Fill",
             Self::Collision => "Collision",
             Self::Elevation => "Elevation",
+            Self::Events => "Events",
         }
     }
 
@@ -43,6 +46,7 @@ impl Tool {
             Self::Fill => "Fill an area of one metatile with the selection (F)",
             Self::Collision => "Drag to make tiles impassable, or passable again (K)",
             Self::Elevation => "Drag to set the tiles' elevation (L)",
+            Self::Events => "The map's events: its people, warps, triggers, signs and hidden items, to see, move, add and edit (V). Nothing is painted in this mode.",
         }
     }
 }
@@ -203,6 +207,10 @@ pub struct Doc {
     tile_sheets: HashMap<(Pair, bool, Option<u8>), Rc<TilesTexture>>,
     /// The Draw tab's layer, pen and colour
     pub draw: crate::draw::Draw,
+    /// The Anim tab's animation and frame
+    pub anim: crate::anim::Anim,
+    /// The Events mode's events, and the one worked on
+    pub events: crate::events::EventsState,
     /// The picker moves metatiles: one dragged onto another changes places with it
     pub moving: bool,
     /// Where the metatile being dragged would go
@@ -279,6 +287,8 @@ impl Doc {
             tile_sections: None,
             tile_sheets: HashMap::new(),
             draw: crate::draw::Draw::default(),
+            anim: crate::anim::Anim::default(),
+            events: crate::events::EventsState::default(),
             moving: false,
             move_to: None,
             tile_users: None,
@@ -325,6 +335,7 @@ impl Doc {
     }
 
     pub fn open_map(&mut self, index: usize) {
+        self.events.forget();
         self.end_stroke();
         self.picking = None;
         self.hover = None;
@@ -334,6 +345,7 @@ impl Doc {
     /// The map again from the ROM, and the tilesets' pictures: after anything that
     /// changed the ROM behind the map on screen
     pub fn reload(&mut self) {
+        self.events.forget();
         self.stroke = None;
         self.forget_tilesets();
         self.layers = None;
@@ -343,7 +355,7 @@ impl Doc {
         self.changed();
     }
 
-    fn changed(&mut self) {
+    pub(crate) fn changed(&mut self) {
         self.edited = self.game.edited_layouts();
         self.unsaved_edits = true;
         self.metatile_uses = None;
@@ -356,6 +368,7 @@ impl Doc {
         self.tile_sections = None;
         self.tile_sheets.clear();
         self.tile_users = None;
+        self.anim.changed();
     }
 
     /// Makes two of the picker's metatiles (whole blocks, in a game of blocks) change
@@ -727,6 +740,7 @@ impl Doc {
             Tool::Fill => self.fill(at, pair, auto),
             Tool::Collision => self.edit_block(at, |b| block::with_collision(b, collision)),
             Tool::Elevation => self.edit_block(at, |b| block::with_elevation(b, elevation)),
+            Tool::Events => {}
         }
     }
 

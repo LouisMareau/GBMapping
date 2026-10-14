@@ -13,6 +13,7 @@ pub enum Tab {
     Metatiles,
     Tileset,
     Draw,
+    Anim,
 }
 
 /// What's kept from one session to the next
@@ -264,7 +265,10 @@ impl App {
                 doc.end_stroke();
                 let applied = doc.game.apply_edits(&edits);
                 doc.commit();
-                let summary = format!("{name}: {} map(s) and {} tileset(s) changed", applied.maps, applied.tilesets);
+                let summary = format!(
+                    "{name}: {} map(s), {} tileset(s) and the events of {} map(s) changed",
+                    applied.maps, applied.tilesets, applied.events
+                );
                 if applied.skipped.is_empty() {
                     self.say(summary);
                 } else {
@@ -359,7 +363,9 @@ impl App {
         }
         let key = |key: Key| ctx.input(|i| i.modifiers.is_none() && i.key_pressed(key));
         let s = &mut self.settings;
-        for (k, tool) in [(Key::P, Tool::Paint), (Key::F, Tool::Fill), (Key::K, Tool::Collision), (Key::L, Tool::Elevation)] {
+        for (k, tool) in
+            [(Key::P, Tool::Paint), (Key::F, Tool::Fill), (Key::K, Tool::Collision), (Key::L, Tool::Elevation), (Key::V, Tool::Events)]
+        {
             if key(k) {
                 s.tool = tool;
             }
@@ -428,10 +434,14 @@ impl App {
             let blocks = self.doc.as_ref().is_some_and(|d| d.grain() > 1);
             let s = &mut self.settings;
             for tool in Tool::ALL {
-                if blocks && matches!(tool, Tool::Collision | Tool::Elevation) {
+                // (a Game Boy Color game's events aren't read yet)
+                if blocks && matches!(tool, Tool::Collision | Tool::Elevation | Tool::Events) {
                     continue;
                 }
-                let selected = s.tool == tool || (blocks && tool == Tool::Paint && matches!(s.tool, Tool::Collision | Tool::Elevation));
+                if tool == Tool::Events {
+                    ui.separator();
+                }
+                let selected = s.tool == tool || (blocks && tool == Tool::Paint && matches!(s.tool, Tool::Collision | Tool::Elevation | Tool::Events));
                 if ui.selectable_label(selected, tool.label()).on_hover_text(tool.hint()).clicked() {
                     s.tool = tool;
                 }
@@ -446,7 +456,7 @@ impl App {
                         "A metatile taken in the picker comes with the collision and elevation it usually has on this game's maps: a tree blocks, water is at its level. Off: only the picture changes.\nWhat's picked on the map (right-click) always comes exactly as it was.",
                     );
                 }
-                Tool::Collision => {}
+                Tool::Collision | Tool::Events => {}
             }
             ui.separator();
             ui.label("Zoom");
@@ -567,6 +577,10 @@ impl App {
                     let Some((reference, shown, h)) = over_reference else { return };
                     format!("Reference ({}, {})  ·  {}", h.x, h.y, side::describe_tile(&reference.game, shown.pair, h.block))
                 }
+                Some(h) if self.settings.tool == Tool::Events && doc.grain() == 1 => match crate::events::describe_at(doc, h.x, h.y) {
+                    Some(events) => format!("({}, {})  ·  {events}", h.x, h.y),
+                    None => format!("({}, {})  ·  no event: a new one goes here", h.x, h.y),
+                },
                 Some(h) => format!("({}, {})  ·  {}", h.x, h.y, side::describe_tile(&doc.game, map.pair, h.block)),
                 None => {
                     let shared = doc.game.layout_users(map.layout.offset).len();
@@ -581,6 +595,13 @@ impl App {
 
     /// The reference, between the map and the side panel: by default this ROM as it was opened
     fn reference_pane(&mut self, ui: &mut Ui) {
+        // in the Events mode, the events' panel is where the reference is
+        if let Some(doc) = self.doc.as_mut().filter(|d| self.settings.tool == Tool::Events && d.grain() == 1) {
+            let room = ui.available_width();
+            let pane = egui::Panel::right("events").resizable(true).default_size(360.0).size_range(300.0..=(room - 200.0).max(300.0));
+            pane.show(ui, |ui| crate::events::panel(ui, doc, &mut self.settings));
+            return;
+        }
         let Some(doc) = self.doc.as_mut().filter(|_| self.settings.show_reference) else { return };
         if doc.reference.is_none() {
             doc.reference = Reference::own(&doc.game, &doc.file_name);
@@ -648,9 +669,10 @@ impl App {
                     ui.heading("Edits kept for this ROM");
                     ui.add_space(6.0);
                     ui.label(format!(
-                        "The last time this ROM was open here, {} map(s) and {} tileset(s) had been changed. Those edits were kept.",
+                        "The last time this ROM was open here, {} map(s), {} tileset(s) and the events of {} map(s) had been changed. Those edits were kept.",
                         edits.maps.len(),
-                        edits.tilesets.len()
+                        edits.tilesets.len(),
+                        edits.events.len()
                     ));
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
@@ -670,7 +692,10 @@ impl App {
                 let applied = doc.game.apply_edits(&edits);
                 doc.commit();
                 doc.unsaved_edits = false;
-                self.say(format!("The kept edits are back: {} map(s), {} tileset(s)", applied.maps, applied.tilesets));
+                self.say(format!(
+                    "The kept edits are back: {} map(s), {} tileset(s), the events of {} map(s)",
+                    applied.maps, applied.tilesets, applied.events
+                ));
             }
             (Some(Dialog::StoredEdits(_)), Some(doc)) => {
                 if let Some(storage) = frame.storage_mut() {
@@ -745,7 +770,8 @@ impl eframe::App for App {
         self.reference_pane(ui);
         egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_gray(17))).show(ui, |ui| match self.doc.as_mut() {
             Some(doc) => {
-                let beside = self.settings.show_reference && doc.reference.as_ref().is_some_and(|r| r.map.is_some());
+                let events = self.settings.tool == Tool::Events && doc.grain() == 1;
+                let beside = self.settings.show_reference && !events && doc.reference.as_ref().is_some_and(|r| r.map.is_some());
                 if beside {
                     map_header(ui, doc);
                 }

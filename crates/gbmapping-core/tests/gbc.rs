@@ -195,6 +195,7 @@ fn a_game_boy_color_rom_is_read_into_the_editors_model() {
     let s = synth();
     let game = open(&s);
     assert_eq!((game.family, game.format.block_size(), game.extension()), (Family::Crystal, 2, "gbc"));
+    assert!(game.animations().is_empty(), "a Game Boy Color game's animations aren't looked for");
     assert_eq!((game.rom.header().title.as_str(), game.rom.header().code.as_str()), ("SYNTH_GBC", "TEST"));
     assert_eq!(game.maps.iter().map(|m| m.id.to_string()).collect::<Vec<_>>(), ["0.0", "0.1", "1.0"]);
     // no names but the places': the maps go by them
