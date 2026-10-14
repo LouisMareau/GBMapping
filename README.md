@@ -23,8 +23,9 @@ and a hack all open the same way.
 | Pokémon FireRed, LeafGreen | BPR*, BPG* | their own layout (640 primary metatiles, 32-bit attributes, sized borders), written from pokefirered and checked on made-up ROMs only; not yet tried on a real one |
 | Pokémon Crystal (Game Boy Color) | BYT* | [its blocks as four tiles each](#game-boy-color-games); checked on the French game. Gold and Silver are laid out much the same and not yet tried. A hack that stores its maps another way (Polished Crystal compresses them) isn't read. |
 
-Not there yet: map sizes, events and connections, metatiles of three layers,
-the first Game Boy's games.
+Not there yet: map sizes and connections, scripts beyond what people and signs
+say, a Game Boy Color game's events, metatiles of three layers, the first Game
+Boy's games.
 
 ## Using it
 
@@ -48,6 +49,11 @@ the first Game Boy's games.
   tile below; set flips, palette, behavior (by name) and layer type. The map
   updates at once. The tiles can be those of [any
   tileset](#metatiles-from-any-tileset).
+- **Events** (`V`): the map's [people, warps, triggers and signs](#events),
+  to see, move, add and edit. Nothing is painted in this mode.
+- **Draw** tab: the selected metatile, [a pixel at a time](#drawing-on-a-metatile).
+  **Anim** tab: [the doors that open, the water, the flowers](#the-tiles-animations),
+  frame by frame.
 - **Undo** / **Redo** (Ctrl+Z, Ctrl+Y) cover everything, map after map.
 - **Save ROM** gives the ROM with your edits. **Export edits** gives a small
   `.json` with only what changed; **Import edits…** (or dropping that file)
@@ -88,6 +94,41 @@ shown in both.
   the **closest-looking metatile** of the edited map's tilesets, with the
   collision and elevation the original had. It's a first draft to correct,
   not a conversion.
+
+### Events
+
+**Events** (`V`) shows the map's events over it, and puts the events' panel
+where the reference is (the reference comes back with the other tools):
+
+- **People and objects** (an item ball, a boulder, a truck) as the game draws
+  them, their sprite's feet on their tile; one whose sprite the game chooses as
+  it runs is a blue **P**. **Warps** are red (**W**), **triggers** green (**T**),
+  **signs** orange (**S**), **hidden items** purple (**I**).
+- **Click** one to work on it (again: the next one on the same tile), **drag**
+  it to move it, `Delete` removes it. A click where there's none is where the
+  next one added goes. **Double-click a warp** to open the map it leads to,
+  its arrival selected.
+- The panel lists them all, **adds** a person, a warp, a trigger, a sign or a
+  hidden item, and edits the one selected: a person's number, sprite (by
+  name, with its picture), elevation, movement, how far they walk, whether
+  they're a trainer and how far they see, the flag that hides them; a warp's
+  map (searched by name) and arrival warp; a trigger's variable and value; a
+  sign's kind; a hidden item's item, flag (**Next free** finds one no hidden
+  item uses) and, in FireRed, how many. **Duplicate** copies one a tile over.
+- **What they say.** A script that only says a text (the games' `msgbox`) is
+  shown as that text, line breaks and boxes as they'll appear. **Write the
+  text** gives the event a new script that says what's typed: it's written at
+  the ROM's free end, and other events that ran the old one keep it. A new
+  line goes to the box's second line, an empty line begins a new box, and
+  `{PLAYER}` or `{RIVAL}` are filled in by the game. A script that does more
+  (a battle, a choice, an item given) is told for what it is and isn't
+  changed; a trainer's battle shows what the trainer says before it.
+
+A list that grows past what it had is moved to the ROM's free end, then grows
+there. Flags and variables go by number. The sprites are found in the ROM by
+the shape of their tables, as the maps are, and a hack that numbers them on 16
+bits (pokeemerald-expansion's layout, to have more than 255) is told by its
+maps: every person of Emerald and of the 16-bit hack checked is drawn.
 
 ### Metatiles from any tileset
 
@@ -169,6 +210,53 @@ pixels to draw on.
 
 Start from **New** for an empty metatile, or from **Duplicate** for a copy of
 one that's close.
+
+### The tiles' animations
+
+Some of a map's tiles move: a door opens when the player walks in, water and
+flowers go through their frames all the time. The **Anim** tab lists the
+animations of the map's two tilesets, the tiles a tileset keeps changing and
+the doors that its metatiles are; **All of the ROM's** lists every one found
+in the ROM, each under its tileset (those of [the maps'
+originals](#the-maps-originals) too, when the profile tells them).
+
+- The **frames** are side by side under the list, as the game has them one
+  after the other: click one to work on it, or go from one to the next with
+  ◀ and ▶.
+- The frame selected is shown large, to **draw on** with the pencil, the
+  eraser and the fill of the [Draw tab](#drawing-on-a-metatile), in the
+  colours of the palette each of its tiles is drawn in (the one under the
+  picture is that of the tile the pointer is on). A stroke is one step to
+  undo.
+- **Ghost** shows the frame before through the one drawn on: what moves from
+  one to the next is seen, and can be drawn to follow.
+- **Play** goes from frame to frame in the order the game shows them: a door
+  opens, stays open and closes; tiles go round as their table says, which is
+  often not 1 2 3 (Emerald's flowers go 2 1 2 3). Drawing stops it.
+
+A frame is drawn on where it is in the ROM: every door that opens with those
+frames, every map of the tileset shows it. A door is its metatile and the one
+over it (1×2; the wide ones 2×2, FireRed's small ones 1×1), and has three
+frames; closed, it's the metatile itself, to draw on in the Draw tab. Tiles
+that change are named by the tiles of the tileset their frames go over
+(`Tiles 0x1FC to 0x1FF`): the metatiles made of those are the ones that move.
+Some frames go over several sets of tiles, one after the other (`8 places`:
+Mauville's flowers don't all move together).
+
+A hack may have more than one table of doors (one per region, say, the same
+metatile being a different door in each): the doors are listed under the
+table they're in, and it's the game's code that picks one for a map, which the
+editor can't tell.
+
+Neither kind is at a known place in a ROM. The doors are a table, found by its
+shape. A tileset's animated tiles are in no table: the tileset names a
+routine, which the editor follows, instruction by instruction, down to the
+frames it copies over the tileset's tiles, where, and how many. Checked
+against the sources of pokeemerald, and of a hack that adds FireRed's: every
+door of the game's table and every animation of its tilesets is found, with
+its frames, their order and the tiles they go over. A hack whose code does
+this another way may have animations that aren't. A Game Boy Color game's
+aren't looked for.
 
 ### A map's tilesets, and where its metatiles are
 
@@ -295,6 +383,20 @@ by ROM address, metatiles by their number in the tileset. A block is
 `metatile | collision << 10 | elevation << 12`; a metatile is eight
 `tile | hflip << 10 | vflip << 11 | palette << 12`.
 
+`"events"` holds, by map, the events of the maps whose events changed, all of
+them (`{"objects": [{"id": 1, "graphics": 7, "x": 5, "y": 8, "elevation": 3,
+"movement": 8, "range": [1, 1], "trainer": 0, "sight": 0, "script":
+"0x081E8022", "flag": 0}], "warps": [{"x": 14, "y": 8, "elevation": 0, "warp":
+1, "group": 1, "num": 2}], "triggers": [{"x": 10, "y": 1, "elevation": 3,
+"var": 16464, "value": 0, "script": "0x…"}], "signs": [{"x": 15, "y": 13,
+"elevation": 0, "kind": 0, "data": "0x…"}]}`). Scripts are ROM addresses: a
+file is for that ROM, or a build with its scripts at the same place, but for
+the scripts written in the editor, which `"scripts"` holds by the address
+they had (`{"0x08E3D23C": {"text": "Hello!", "std": 2}}`): applied, each is
+written anew, and the events that ran it run the new one. What rebuilds a game
+from its sources has to write the events into the maps' `map.json` and the
+texts as scripts.
+
 A Game Boy Color game's edits are told in the editor's terms: a map twice as
 wide and as high as it has blocks, each of its tiles the quarter of a block,
 `((block / 4) * 2 + y) * 8 + (block % 4) * 2 + x` for the quarter at `x`, `y`
@@ -322,6 +424,14 @@ tileset, and a palette's 16 colours (15 bits each) by its number. What reads
 an edits file to rebuild a game from its sources has to write those too, or
 the metatiles point at tiles that aren't there.
 
+`"graphics"` holds the tiles of [animations' frames](#the-tiles-animations)
+that were drawn on: a tile's 32 bytes in hexadecimal, by where the tile is in
+the ROM (`{"0x510644": "0011…"}`). They aren't part of a tileset, and are
+written where they are: such a file is for that ROM, or a build that has its
+frames at the same place. Applied, only what is a frame's tile in that ROM is
+written; the rest is told and left alone. What rebuilds a game from its
+sources has to find the picture the frame comes from instead.
+
 ## Building
 
 Rust (stable) with the `wasm32-unknown-unknown` target, and
@@ -342,9 +452,9 @@ runs the desktop program.
 
 | | |
 | --- | --- |
-| `crates/gbmapping-core` | the ROM: finding the tables, reading maps and tilesets, drawing, editing, undo, edits files; `gbc` reads a Game Boy Color ROM into the same model and writes the edits back. No UI, no I/O. |
+| `crates/gbmapping-core` | the ROM: finding the tables, reading maps and tilesets, drawing, editing, undo, edits files; `events` reads and writes the maps' events and the texts they say, `sprites` finds the people's sprites; `anims` finds the tiles' animations; `gbc` reads a Game Boy Color ROM into the same model and writes the edits back. No UI, no I/O. |
 | `crates/gbmapping` | the editor, with [egui](https://github.com/emilk/egui); its page, manifest and service worker for the web |
-| `tools/` | generators (behavior names, map names, icons) and the browser check |
+| `tools/` | generators (behavior names, map names, the names of sprites, movements and items, icons) and the browser check |
 
 ### Checks
 
@@ -355,7 +465,8 @@ cargo test -p gbmapping-core
 runs the core's tests on made-up ROMs. Real ones can't be in the repository;
 name yours and they're opened, drawn and edited too. A ROM's profile goes
 after it, behind a `|`: every original it tells is then read and checked
-(its own tilesets, every metatile it uses, the map's size). A `.gbc` has its
+(its own tilesets, every metatile it uses, the map's size). Every map's events
+are read and written back, which must change no byte. A `.gbc` has its
 own check: read, drawn in colours, saved as it was opened, then with a block
 painted:
 
@@ -376,8 +487,9 @@ file chooser, tiles painted with the mouse, undo, the saved ROM and the
 exported edits compared with what they should be, tiles taken back from the
 reference, a map's original shown on its own tilesets when the profile tells
 one, a tileset copied for a map, two metatiles made to change places, a
-metatile duplicated and drawn on, a tile of another tileset put in a
-metatile, each undone, the edits kept across a reload, the app installable
+metatile duplicated and drawn on, a frame of an animation drawn on, a tile of
+another tileset put in a metatile, a person added who says a text and another
+dragged in the Events mode, each undone, the edits kept across a reload, the app installable
 and working offline. Screenshots land in
 `target/browser-check/`. A second ROM is opened as the reference of the first,
 with the first's map `map` on screen: Crystal next to the hack that has its

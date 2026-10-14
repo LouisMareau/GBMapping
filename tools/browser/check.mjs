@@ -75,6 +75,30 @@ const draw = {
   pixel: (x, y) => [WIDTH - 292 + 9 + x * 17 + 8, 187 + y * 17 + 8],
   color: (i) => [WIDTH - 292 + 9 + i * 17 + 8, 495],
 };
+/// The Anim tab: its tab, the box that lists every animation of the ROM, the list and its
+/// first entry under its tileset's name (tiles of 16x16 pixels, in the games checked), the frame `i` of those side
+/// by side, the Ghost box, the pixel (x, y) of the frame drawn on, and the colour `i` of
+/// the palette under it
+const anim = {
+  tab: [WIDTH - 292 + 190, 49],
+  all: [WIDTH - 292 + 16, 79],
+  list: [WIDTH - 292 + 140, 100],
+  first: [WIDTH - 292 + 100, 137],
+  frame: (i) => [WIDTH - 292 + 35 + i * 54, 161],
+  ghost: [WIDTH - 292 + 114, 199],
+  pixel: (x, y) => [WIDTH - 292 + 9 + x * 17 + 8, 232 + y * 17 + 8],
+  color: (i) => [WIDTH - 292 + 9 + i * 17 + 8, 532],
+};
+/// The Events mode, on Littleroot Town at zoom 2 (its events' panel where the reference
+/// is, 360 wide): the map's tile (x, y), the button that adds a person, the text a new
+/// person says, and the button that writes it
+const eventsPanel = WIDTH - 292 - 360;
+const events = {
+  tile: (x, y) => [242 + x * 32 + 16, 135 + y * 32 + 16],
+  addPerson: [eventsPanel + 57, 93],
+  text: [eventsPanel + 180, 752],
+  write: [eventsPanel + 54, 820],
+};
 /// Where the two maps' top left corners are then
 const [mapCorner, referenceCorner] = [[242, 97], [682, 97]];
 /// The reference's source menu, and its entries when the ROM keeps its maps' originals
@@ -371,6 +395,34 @@ try {
     await browser.key('z', { ctrl: true });
     const uncopied = await download(toolbar.exportEdits);
     check('undone, the tileset has the metatiles it had', !!uncopied && !!edited && uncopied.equals(edited));
+    // an animation's frame drawn on, the frame before showing through it: the first animation
+    // of the ROM (tiles its first tileset keeps changing), its second frame. The edits tell the
+    // frame's tiles by where they are, and nothing else.
+    await browser.click(...anim.tab);
+    await browser.click(...anim.all);
+    await browser.click(...anim.list);
+    await browser.click(...anim.first);
+    await browser.click(...anim.frame(1));
+    await browser.click(...anim.ghost);
+    await browser.click(...anim.color(13));
+    await browser.drag([anim.pixel(1, 1), anim.pixel(6, 6)]);
+    await browser.drag([anim.pixel(14, 1), anim.pixel(9, 6)]);
+    await browser.move(WIDTH / 2, HEIGHT / 2);
+    await shot('frame-drawn-on');
+    const framed = await download(toolbar.exportEdits);
+    const withFrame = framed ? JSON.parse(framed.toString()) : {};
+    const frameTiles = Object.entries(withFrame.graphics ?? {});
+    const rest = JSON.stringify({ ...withFrame, graphics: undefined }) === JSON.stringify(edited ? JSON.parse(edited.toString()) : null);
+    check('a frame of an animation is drawn on: the edits tell its tiles, where they are in the ROM', frameTiles.length >= 1 && frameTiles.length <= 4 && frameTiles.every(([at, tile]) => /^0x[0-9A-F]{6}$/.test(at) && tile.length === 64) && rest, `${frameTiles.length} tile(s) at ${frameTiles.map(([at]) => at).join(', ')}${rest ? '' : ', and something else changed'}`);
+    let unframed = framed;
+    for (let i = 0; i < 3 && !(unframed && edited && unframed.equals(edited)); i++) {
+      await browser.key('z', { ctrl: true });
+      unframed = await download(toolbar.exportEdits);
+    }
+    check('the strokes undone, the frame is what it was', !!unframed && !!edited && unframed.equals(edited));
+    await browser.click(...anim.ghost);
+    await browser.click(...anim.all);
+    await browser.click(...tilesetTab);
     await browser.click(...tile(1, 1), 'right');
     await browser.click(...tilesetPanel.nextFree);
     await shot('tileset-tab-colours');
@@ -393,6 +445,47 @@ try {
     check('undone, the edits are what they were', !!back && !!edited && back.equals(edited));
     await browser.click(...tilesetPanel.allTilesets);
     await browser.click(...metatilesTab);
+
+    // -- the events: a person added on Littleroot Town, made to say something; Mom moved a tile ----
+    // (in this mode the map isn't painted: the edits tell no map's blocks)
+    await browser.click(...searchBox);
+    await browser.key('a', { ctrl: true });
+    await browser.type('LittlerootTown');
+    await browser.click(...firstMap);
+    for (let i = 2; i < ZOOM; i++) await browser.key('-');
+    await browser.key('v');
+    await browser.wait(500);
+    await browser.click(...events.tile(8, 11));
+    await browser.click(...events.addPerson);
+    await browser.click(...events.text);
+    await browser.type('Hello from GBMapping!');
+    await browser.click(...events.write);
+    await browser.move(WIDTH / 2, HEIGHT - 8);
+    await shot('events-person-added');
+    const baseline = edited ? JSON.parse(edited.toString()) : {};
+    const editsNow = async () => {
+      const file = await download(toolbar.exportEdits);
+      return file ? JSON.parse(file.toString()) : {};
+    };
+    const withPerson = await editsNow();
+    const [eventsOf, mapEvents] = Object.entries(withPerson.events ?? {})[0] ?? [];
+    const person = mapEvents?.objects?.at(-1);
+    const says = Object.values(withPerson.scripts ?? {}).map((script) => script.text);
+    const unpainted = JSON.stringify(withPerson.maps ?? {}) === JSON.stringify(baseline.maps ?? {});
+    check('a person added in the Events mode, who says a text: the edits tell the map\'s events and the script', !!person && person.x === 8 && person.y === 11 && says.includes('Hello from GBMapping!') && unpainted, `map ${eventsOf}: ${mapEvents?.objects?.length} people, the last at (${person?.x}, ${person?.y}); scripts ${JSON.stringify(says)}${unpainted ? '' : '; the map was painted'}`);
+    await browser.drag([events.tile(5, 8), events.tile(6, 8), events.tile(6, 9)]);
+    await browser.move(WIDTH / 2, HEIGHT - 8);
+    await shot('events-mom-moved');
+    const momMoved = (await editsNow()).events?.[eventsOf]?.objects?.[3];
+    check('an event dragged on the map moves there', momMoved?.x === 6 && momMoved?.y === 9, `Mom at (${momMoved?.x}, ${momMoved?.y})`);
+    let unevented = await download(toolbar.exportEdits);
+    for (let i = 0; i < 4 && !(unevented && edited && unevented.equals(edited)); i++) {
+      await browser.key('z', { ctrl: true });
+      unevented = await download(toolbar.exportEdits);
+    }
+    check('undone, the map has the events it had', !!unevented && !!edited && unevented.equals(edited));
+    await browser.key('p');
+    for (let i = 2; i < ZOOM; i++) await browser.key('=');
 
     // -- another ROM as the reference: a Game Boy Color game next to the Advance one made of it ------
     if (reference) {

@@ -9,10 +9,16 @@
 //!                            "tiles": {"498": "00112233..."}, "palettes": {"12": [0, 32767, ...]}}}}
 //! ```
 //!
+//! `events` holds, by map, the events of the maps whose events changed: all four
+//! lists, whole (see `events::Events`). `scripts` holds the scripts the editor wrote
+//! that they run, by the address they had: a text said, which is written anew where
+//! the file is applied, and the events that ran it run the new one.
+//!
 //! `tiles` and `palettes` are there when tiles were brought from another tileset: a
 //! tile's 32 bytes in hexadecimal (4 bits a pixel, as the console has them) by its
 //! number in the tileset, a palette's 16 colours (15 bits each) by its number.
 
+use crate::events::{Events, MadeScript};
 use crate::format::ENTRIES;
 use crate::game::{attribute_in, entries_in, Game, MapId};
 use crate::structs::Tileset;
@@ -38,6 +44,16 @@ pub struct Edits {
     /// renumbered: metatiles that changed places are followed there too
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub originals: BTreeMap<String, MapEdit>,
+    /// The tiles of animations' frames that were drawn on: where a tile is in the ROM ->
+    /// its 32 bytes (4 bits a pixel), in hexadecimal
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub graphics: BTreeMap<String, String>,
+    /// The events of the maps whose events changed, by map: all of them
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub events: BTreeMap<String, Events>,
+    /// The scripts the editor wrote that those run, by the address they had ("0x08…")
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub scripts: BTreeMap<String, MadeScript>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
@@ -103,18 +119,20 @@ fn from_hex(hex: &str) -> Option<Vec<u8>> {
 pub struct Applied {
     pub maps: usize,
     pub tilesets: usize,
+    /// The maps whose events were written
+    pub events: usize,
     /// What couldn't be applied, and why
     pub skipped: Vec<String>,
 }
 
 impl Edits {
     pub fn is_empty(&self) -> bool {
-        self.maps.is_empty() && self.tilesets.is_empty() && self.originals.is_empty()
+        self.maps.is_empty() && self.tilesets.is_empty() && self.originals.is_empty() && self.graphics.is_empty() && self.events.is_empty()
     }
 
-    /// How many maps and tilesets the file changes
+    /// How many maps and tilesets the file changes (the maps' events counted with the maps)
     pub fn len(&self) -> usize {
-        self.maps.len() + self.tilesets.len()
+        self.maps.len() + self.tilesets.len() + self.events.keys().filter(|key| !self.maps.contains_key(*key)).count()
     }
 
     pub fn to_json(&self) -> String {
@@ -178,6 +196,25 @@ impl Game {
                 let renumbered =
                     MapEdit { width: m.width, height: m.height, blocks: m.blocks, border: m.border, primary: None, secondary: None };
                 edits.originals.insert(info.id.to_string(), renumbered);
+            }
+        }
+        // the frames of animations: the tiles drawn on that aren't what they were
+        for &tile in &self.drawn_graphics {
+            let (now, then) = (self.rom.bytes().get(tile..tile + 32), self.original().bytes().get(tile..tile + 32));
+            if let Some(now) = now.filter(|_| now != then) {
+                edits.graphics.insert(tileset_key(tile), to_hex(now));
+            }
+        }
+        // the events: every list of a map whose events changed, and the scripts written here they run
+        for (index, info) in self.maps.iter().enumerate() {
+            let now = self.events(index);
+            if now != self.events_then(index) {
+                for script in now.scripts() {
+                    if let Some(made) = self.made_script(script) {
+                        edits.scripts.insert(format!("0x{script:08X}"), made.clone());
+                    }
+                }
+                edits.events.insert(info.id.to_string(), now);
             }
         }
         let mut seen = BTreeSet::new();
@@ -257,6 +294,40 @@ impl Game {
                 }
             }
             applied.maps += 1;
+        }
+        // the frames of animations: only where this ROM has one is written
+        let frames = if edits.graphics.is_empty() { BTreeSet::new() } else { self.frame_tiles() };
+        for (key, hex) in &edits.graphics {
+            match (parse_address(key).filter(|at| frames.contains(at)), from_hex(hex).filter(|tile| tile.len() == 32)) {
+                (Some(at), Some(tile)) => {
+                    tile.iter().enumerate().for_each(|(i, &b)| self.rom.write8(at + i, b));
+                    self.drawn_graphics.insert(at);
+                }
+                (None, _) => applied.skipped.push(format!("the graphics at {key}: no frame of an animation is there in this ROM")),
+                (_, None) => applied.skipped.push(format!("the graphics at {key}: not a tile")),
+            }
+        }
+        // the scripts written in the editor, written anew here; then the events, which run them
+        let mut written: BTreeMap<u32, u32> = BTreeMap::new();
+        for (key, made) in &edits.scripts {
+            let address = u32::from_str_radix(key.trim_start_matches("0x").trim_start_matches("0X"), 16);
+            match (address, self.new_message_script(&made.text, made.std)) {
+                (Ok(then), Ok(now)) => drop(written.insert(then, now)),
+                (Err(_), _) => applied.skipped.push(format!("the script {key}: not an address")),
+                (_, Err(problem)) => applied.skipped.push(format!("the script {key}: {problem}")),
+            }
+        }
+        for (key, events) in &edits.events {
+            let Some(index) = key.parse::<MapId>().ok().and_then(|id| self.map_index(id)) else {
+                applied.skipped.push(format!("the events of map {key}: not in this ROM"));
+                continue;
+            };
+            let mut events = events.clone();
+            events.rename_scripts(|script| written.get(&script).copied());
+            match self.set_events(index, &events) {
+                Ok(()) => applied.events += 1,
+                Err(problem) => applied.skipped.push(format!("the events of map {key}: {problem}")),
+            }
         }
         for (key, e) in &edits.originals {
             let index = key.parse::<MapId>().ok().and_then(|id| self.map_index(id));

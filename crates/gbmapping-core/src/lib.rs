@@ -2,8 +2,11 @@
 //! games of the third generation and their hacks) and edits them in place. No UI and
 //! no I/O: it's given a ROM's bytes and gives them back.
 
+pub mod anims;
 pub mod behaviors;
 pub mod edits;
+pub mod event_names;
+pub mod events;
 pub mod format;
 pub mod game;
 pub mod gbc;
@@ -14,6 +17,7 @@ pub mod pixels;
 pub mod profile;
 pub mod rom;
 pub mod scan;
+pub mod sprites;
 pub mod structs;
 pub mod text;
 pub mod tiles;

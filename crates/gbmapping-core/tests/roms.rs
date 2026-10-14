@@ -5,6 +5,7 @@
 //!
 //!     GBMAPPING_TEST_ROMS="emerald.gba;my-hack.gba|my-hack.json;crystal.gbc" cargo test -p gbmapping-core --test roms -- --nocapture
 
+use gbmapping_core::anims::Kind;
 use gbmapping_core::format::block;
 use gbmapping_core::gbc::{is_game_boy, quarter};
 use gbmapping_core::metatiles::GrowError;
@@ -556,5 +557,163 @@ fn metatiles_change_places_and_no_map_looks_different() {
         );
         assert!(game.undo().is_some() && !game.modified(), "{path}: undone in one step");
         println!("{path}: {} metatiles changed places, {renumbered} tiles renumbered on {} maps", moved.len(), edits.maps.len());
+    }
+}
+
+#[test]
+fn the_tiles_animations_are_found_and_drawn_on() {
+    for (path, bytes, profile) in named() {
+        // with its profile, a ROM tells its maps' originals: the tilesets those are drawn with have animations too
+        let profile = || profile.as_ref().map_or_else(Profile::default, |text| Profile::from_json(text).unwrap());
+        let mut game = Game::open(bytes.clone(), &path, profile()).unwrap();
+        let started = std::time::Instant::now();
+        let animations = game.animations();
+        let took = started.elapsed().as_millis();
+        let doors = animations.iter().filter(|a| matches!(a.kind, Kind::Door { .. })).count();
+        let tiles = animations.len() - doors;
+        assert!(doors >= 20 && tiles >= 10, "{path}: {doors} doors, {tiles} sets of animated tiles");
+        let usage = game.tile_usage();
+        for animation in &animations {
+            let (width, height) = animation.size();
+            let what = animation.label();
+            assert!(
+                !animation.frames.is_empty() && animation.tiles >= 1 && animation.sequence.iter().all(|&f| f < animation.frames.len()),
+                "{path}: {what}"
+            );
+            assert!(animation.frames.iter().all(|&at| at + animation.tiles * 32 <= game.rom.len()), "{path}: {what}");
+            let palettes = game.animation_palettes(animation, &usage);
+            assert_eq!(
+                (palettes.len(), game.frame_pixels(animation, 0, &palettes).len()),
+                (animation.tiles, width * height),
+                "{path}: {what}"
+            );
+            for tile in 0..animation.tiles {
+                let (x, y) = animation.place(tile);
+                assert_eq!(animation.tile_at(x + 3, y + 5), Some(tile), "{path}: {what}");
+            }
+            if let Kind::Tiles { tileset, tile } = animation.kind {
+                let places = [tile].into_iter().chain(animation.also.iter().copied());
+                assert!(game.tileset(tileset).is_some() && places.clone().all(|tile| tile + animation.tiles <= 1024), "{path}: {what}");
+                assert_eq!(places.collect::<BTreeSet<_>>().len(), animation.also.len() + 1, "{path}: {what}: a place told twice");
+            }
+        }
+        // they animate: their frames aren't all the same picture
+        let moves = |a: &gbmapping_core::anims::Animation| {
+            (1..a.frames.len()).any(|f| game.frame_pixels(a, f, &[]) != game.frame_pixels(a, 0, &[]))
+        };
+        let moving = animations.iter().filter(|a| moves(a)).count();
+        assert!(moving * 10 >= animations.len() * 8, "{path}: only {moving} of {} animations have frames that differ", animations.len());
+
+        // a door's frame drawn on: two pixels of the ROM, told by the edits as that frame's tiles
+        let door = animations.iter().find(|a| matches!(a.kind, Kind::Door { .. })).unwrap().clone();
+        let palettes = game.animation_palettes(&door, &usage);
+        let width = door.size().0;
+        let color = if game.frame_pixels(&door, 1, &palettes)[0].0 == 5 { 6 } else { 5 };
+        assert!(game.draw_on_frame(&door, 1, &[(0, 0, color), (9, 9, color), (99, 0, color)]) && game.commit(), "{path}");
+        let drawn = game.frame_pixels(&door, 1, &palettes);
+        assert_eq!((drawn[0].0, drawn[9 * width + 9].0), (color, color), "{path}");
+        let differing = (0..bytes.len()).filter(|&i| game.rom.bytes()[i] != bytes[i]).count();
+        assert!((1..=2).contains(&differing), "{path}: {differing} bytes");
+        let edits = game.collect_edits();
+        assert_eq!(
+            (edits.maps.len(), edits.tilesets.len(), edits.graphics.len() <= 2 && !edits.graphics.is_empty()),
+            (0, 0, true),
+            "{path}"
+        );
+        let mut copy = Game::open(bytes.clone(), &path, profile()).unwrap();
+        let applied = copy.apply_edits(&Edits::from_json(&edits.to_json()).unwrap());
+        assert!(applied.skipped.is_empty(), "{path}: {:?}", applied.skipped);
+        copy.commit();
+        assert!(copy.rom.bytes() == game.rom.bytes() && copy.collect_edits() == edits, "{path}");
+        assert!(game.undo().is_some() && !game.modified() && game.collect_edits().is_empty(), "{path}: undone");
+        // whose they are: nearly every one is some map's (a door is, when a metatile of the map's tilesets is that door)
+        let pairs = game.pairs();
+        let someones = animations.iter().filter(|a| pairs.iter().any(|&pair| game.animates(a, pair))).count();
+        assert!(someones * 10 >= animations.len() * 8, "{path}: only {someones} of {} animations are a map's", animations.len());
+        for animation in &animations {
+            let pair = game.animation_pair(animation, *pairs.first().unwrap());
+            assert!(game.tileset(pair.primary).is_some() && game.tileset(pair.secondary).is_some(), "{path}: {}", animation.label());
+        }
+        println!(
+            "{path}: {doors} doors and {tiles} sets of animated tiles, found in {took} ms; {moving} of them all have frames that differ, {someones} are a map's"
+        );
+    }
+}
+
+#[test]
+fn the_maps_events_are_read_written_and_drawn() {
+    use gbmapping_core::events::{Names, Object, ScriptView, MSGBOX_NPC};
+    for (path, bytes, profile) in named() {
+        let profile = || profile.as_ref().map_or_else(Profile::default, |text| Profile::from_json(text).unwrap());
+        let mut game = Game::open(bytes.clone(), &path, profile()).unwrap();
+        // every map's events, written back as they were read: nothing changes
+        let mut counts = [0usize; 4];
+        for i in 0..game.maps.len() {
+            let events = game.events(i);
+            counts[0] += events.objects.len();
+            counts[1] += events.warps.len();
+            counts[2] += events.triggers.len();
+            counts[3] += events.signs.len();
+            game.set_events(i, &events).unwrap_or_else(|e| panic!("{path}: map {i}: {e}"));
+        }
+        assert!(!game.commit() && game.rom.bytes() == &bytes[..], "{path}: the events written back as read changed the ROM");
+        assert!(counts.iter().all(|&n| n >= 100), "{path}: {counts:?}");
+        // the warps lead to maps of the ROM
+        let warps: Vec<_> = (0..game.maps.len()).flat_map(|i| game.events(i).warps).collect();
+        let lost = warps
+            .iter()
+            .filter(|w| (w.group, w.num) != (0x7F, 0x7F) && game.map_index(MapId { group: w.group, num: w.num }).is_none())
+            .count();
+        assert!(lost * 100 <= warps.len(), "{path}: {lost} of {} warps lead to no map", warps.len());
+
+        // the people are drawn: nearly all have a sprite (not those the game chooses as it runs)
+        let names = Names::of(game.family);
+        let sprites = game.sprites();
+        let people: Vec<Object> = (0..game.maps.len()).flat_map(|i| game.events(i).objects).collect();
+        let fixed: Vec<&Object> =
+            people.iter().filter(|o| !Names::find(names.graphics, o.graphics).is_some_and(|n| n.starts_with("VAR_"))).collect();
+        let drawn = fixed.iter().filter(|o| game.sprite(&sprites, o.graphics).is_some()).count();
+        assert!(drawn * 100 >= fixed.len() * 98, "{path}: {drawn} of {} people have a sprite", fixed.len());
+        let says = people.iter().filter(|o| matches!(game.script_view(o.script), ScriptView::Says(_))).count();
+        assert!(says * 10 >= people.len(), "{path}: only {says} of {} people say a text", people.len());
+
+        // a new person on the first map, who says something: carried by an edits file to another copy
+        let script = game.new_message_script("I'm new here!\nHello, {PLAYER}.", MSGBOX_NPC).unwrap();
+        let mut events = game.events(0);
+        let person = Object {
+            id: events.next_object_id(),
+            graphics: people[0].graphics,
+            x: 1,
+            y: 1,
+            elevation: 3,
+            movement: 8,
+            script,
+            ..Default::default()
+        };
+        events.objects.push(person);
+        game.set_events(0, &events).unwrap();
+        assert!(game.commit());
+        assert_eq!(game.events(0), events, "{path}");
+        let edits = game.collect_edits();
+        assert_eq!((edits.events.len(), edits.scripts.len(), edits.maps.len(), edits.tilesets.len()), (1, 1, 0, 0), "{path}");
+        let mut copy = Game::open(bytes.clone(), &path, profile()).unwrap();
+        let applied = copy.apply_edits(&Edits::from_json(&edits.to_json()).unwrap());
+        assert!(applied.skipped.is_empty(), "{path}: {:?}", applied.skipped);
+        copy.commit();
+        let carried = copy.events(0);
+        assert_eq!(carried.objects.len(), events.objects.len(), "{path}");
+        let said = copy.script_view(carried.objects.last().unwrap().script);
+        assert!(matches!(said, ScriptView::Says(ref s) if s.text == "I’m new here!\nHello, {PLAYER}."), "{path}: {said:?}");
+        assert!(game.undo().is_some() && game.events(0) != events, "{path}: undone");
+        println!(
+            "{path}: {} people, {} warps, {} triggers, {} signs; {} sprites ({drawn} of {} people drawn, {says} say a text); objects tell their sprite on {} bits",
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            sprites.count(),
+            fixed.len(),
+            if game.objects_wide() { 16 } else { 8 }
+        );
     }
 }

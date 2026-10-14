@@ -1,7 +1,11 @@
 //! A tiny made-up ROM per family, laid out like the games lay theirs: everything the
 //! core does, checked without a copyrighted byte.
 
+use gbmapping_core::anims::Kind;
 use gbmapping_core::edits::NewTileset;
+use gbmapping_core::events::{
+    Events, EventsError, HiddenItem, List, Object, Says, ScriptView, Sign, Trigger, Warp, HIDDEN_ITEM, MSGBOX_NPC,
+};
 use gbmapping_core::format::block;
 use gbmapping_core::gfx::TileEntry;
 use gbmapping_core::metatiles::{GrowError, MoveError};
@@ -1041,5 +1045,304 @@ fn metatiles_change_places_and_the_maps_follow() {
 
         while game.undo().is_some() {}
         assert!(!game.modified() && look(&game) == pictures, "{family:?}: all undone");
+    }
+}
+
+/// Gives a made-up ROM animations, written where its unused end begins: two tiles of
+/// the primary tileset that its routine keeps changing, at two places (three frames,
+/// shown in the order 2 1 2 3), and a table of four doors (two that open the same way, a wide one,
+/// a small one). Returns where they begin: the tiles' frames, then at 0x100, 0x400 and
+/// 0xA00 the doors'.
+fn animated(s: &mut Synth, kanto: bool) -> usize {
+    let at = s.bytes.len() - FREE;
+    let p = |o: usize| 0x0800_0000 + (at + o) as u32;
+    let mut data = vec![0u8; 0xC38];
+    fn words(data: &mut [u8], o: usize, words: &[u32]) {
+        for (i, w) in words.iter().enumerate() {
+            data[o + i * 4..o + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+    }
+    fn halves(data: &mut [u8], o: usize, halves: &[u16]) {
+        for (i, h) in halves.iter().enumerate() {
+            data[o + i * 2..o + i * 2 + 2].copy_from_slice(&h.to_le_bytes());
+        }
+    }
+    // the tiles that change: three frames of two tiles, and the table of the order they're shown in
+    for frame in 0..3 {
+        data[frame * 0x40..(frame + 1) * 0x40].fill(0x11 * (frame as u8 + 1));
+    }
+    words(&mut data, 0xC0, &[p(0x40), p(0), p(0x40), p(0x80), 0]);
+    // the doors' frames: 1x2 (8 tiles a frame), 2x2 (16), 1x1 (4)
+    for (o, tiles) in [(0x100, 8), (0x400, 16), (0xA00, 4)] {
+        for frame in 0..3 {
+            data[o + frame * tiles * 32..o + (frame + 1) * tiles * 32].fill(0x11 * (frame as u8 + 4));
+        }
+    }
+    // the palettes of a door's tiles: its top metatile's four, its bottom one's
+    data[0xB80..0xB90].copy_from_slice(&[1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3]);
+    // the doors: the metatile, a sound, a size, the frames, the palettes; and an empty one
+    let first = s.first_secondary;
+    for (i, (metatile, sound, size, frames, palettes)) in
+        [(1, 0, 1, 0x100, 0xB80), (2, 1, 1, 0x100, 0xB80), (first, 0, 2, 0x400, 0xB88), (first + 1, 0, 0, 0xA00, 0xB80)]
+            .into_iter()
+            .enumerate()
+    {
+        let o = 0xB90 + i * 12;
+        halves(&mut data, o, &[metatile]);
+        (data[o + 2], data[o + 3]) = (sound, size);
+        words(&mut data, o + 4, &[p(frames), p(palettes)]);
+    }
+    // the tileset's routine: it tells which routine to run each frame...
+    halves(&mut data, 0xC00, &[0x4800, 0x4770]); // ldr r0, =each_frame; bx lr
+    words(&mut data, 0xC04, &[p(0xC08) | 1]);
+    // ...which calls one per animation...
+    halves(&mut data, 0xC08, &[0xB500, 0xF000, 0xF801, 0xBD00]); // push {lr}; bl queue; pop {pc}
+                                                                 // ...which copies a frame of the table's over the tileset's tile 1, and over its tile 16: 0x40 bytes of it
+    halves(&mut data, 0xC10, &[0xB500, 0x4805, 0x4905, 0x2240, 0xF000, 0xF80C]); // ldr r0, =table; ldr r1, =tile; mov r2, #0x40; bl copy
+    halves(&mut data, 0xC1C, &[0x4904, 0x2240, 0xF000, 0xF808, 0xBD00, 0]); // ldr r1, =other_tile; mov r2, #0x40; bl copy; pop {pc}
+    words(&mut data, 0xC28, &[p(0xC0), 0x0600_0020, 0x0600_0200]);
+    halves(&mut data, 0xC34, &[0x4770, 0]); // bx lr
+    s.bytes[at..at + data.len()].copy_from_slice(&data);
+    let routine = s.primary + if kanto { 16 } else { 20 };
+    s.bytes[routine..routine + 4].copy_from_slice(&(p(0xC00) | 1).to_le_bytes());
+    at
+}
+
+#[test]
+fn the_animations_of_tiles_are_found_and_drawn_on() {
+    for (mut s, family) in both() {
+        let at = animated(&mut s, family == Family::FireRedLeafGreen);
+        let mut game = open(&s);
+        let pair = game.load_map(0).unwrap().pair;
+        let first = s.first_secondary;
+        let found = game.animations();
+        assert_eq!(
+            found.iter().map(|a| a.kind.clone()).collect::<Vec<_>>(),
+            [
+                Kind::Tiles { tileset: s.primary, tile: 1 },
+                Kind::Door { metatiles: vec![1, 2], across: 1, down: 2 },
+                Kind::Door { metatiles: vec![first], across: 2, down: 2 },
+                Kind::Door { metatiles: vec![first + 1], across: 1, down: 1 },
+            ],
+            "{family:?}"
+        );
+        let [changing, door, wide, small] = &found[..] else { unreachable!() };
+        // where the frames are; the tiles' are shown in the order their table has them
+        assert_eq!(
+            (&changing.frames[..], &changing.sequence[..], changing.tiles, changing.size()),
+            (&[at, at + 0x40, at + 0x80][..], &[1, 0, 1, 2][..], 2, (16, 8))
+        );
+        assert_eq!((&door.frames[..], door.tiles, door.size()), (&[at + 0x100, at + 0x200, at + 0x300][..], 8, (16, 32)));
+        assert_eq!((&wide.frames[..], wide.tiles, wide.size()), (&[at + 0x400, at + 0x600, at + 0x800][..], 16, (32, 32)));
+        assert_eq!((&small.frames[..], small.tiles, small.size()), (&[at + 0xA00, at + 0xA80, at + 0xB00][..], 4, (16, 16)));
+        assert_eq!(
+            (&changing.also[..], door.also.len(), changing.label().as_str()),
+            (&[16][..], 0, "Tiles 0x001 to 0x002 · 2 places · 3 frames")
+        );
+        assert_eq!([changing.table, door.table, wide.table, small.table], [at + 0xC0, at + 0xB90, at + 0xB90, at + 0xB90]);
+        // a wide door's tiles go down its left side, then down its right
+        assert_eq!(
+            [wide.place(0), wide.place(3), wide.place(4), wide.place(8), wide.place(15)],
+            [(0, 0), (8, 8), (0, 16), (16, 0), (24, 24)]
+        );
+        assert_eq!(
+            (wide.tile_at(17, 9), wide.tile_at(32, 0), small.tile_at(0, 16), changing.tile_at(9, 7)),
+            (Some(10), None, None, Some(1))
+        );
+
+        // the palettes: a door's are told with it; tiles are in the one their metatiles draw them in
+        let usage = game.tile_usage();
+        assert_eq!(game.animation_palettes(door, &usage), [1, 1, 1, 1, 2, 2, 2, 2]);
+        assert_eq!(game.animation_palettes(wide, &usage), [3; 16]);
+        assert_eq!(game.animation_palettes(changing, &usage), [0, 0]);
+        let pixels = game.frame_pixels(changing, 1, &[0, 5]);
+        assert_eq!((pixels.len(), pixels[0], pixels[8]), (128, (2, 0), (2, 5)));
+
+        // whose they are: a tileset's tiles are its pairs'; a door is the pairs' where a metatile is that door
+        assert!(game.animates(changing, pair) && !game.animates(door, pair), "{family:?}");
+        let a_door = game.format.behaviors.iter().find(|(_, name)| name.contains("DOOR")).unwrap().0;
+        game.set_attribute(pair, 2, a_door as u32);
+        assert!(game.commit() && game.animates(door, pair) && !game.animates(wide, pair), "{family:?}");
+        assert_eq!(game.animation_pair(door, pair), pair);
+        assert!(game.undo().is_some() && !game.animates(door, pair));
+
+        // drawn on: one pixel of a frame, in the ROM where the frame is (the other one is off the frame)
+        let before = game.rom.bytes().to_vec();
+        assert!(game.draw_on_frame(wide, 2, &[(17, 9, 7), (40, 0, 7)]) && game.commit(), "{family:?}");
+        let tile = at + 0x800 + 10 * 32;
+        assert_eq!(game.rom.bytes()[tile + 4], 0x76, "the second of the byte's two pixels");
+        assert_eq!((0..before.len()).filter(|&i| game.rom.bytes()[i] != before[i]).collect::<Vec<_>>(), [tile + 4]);
+        assert_eq!(game.frame_pixels(wide, 2, &[])[9 * 32 + 17].0, 7);
+        assert!(!game.draw_on_frame(wide, 2, &[(17, 9, 7)]), "the same again changes nothing");
+        game.commit();
+
+        // the edits tell the tile drawn on, and carry it to another copy
+        let edits = game.collect_edits();
+        assert_eq!((edits.maps.len(), edits.tilesets.len()), (0, 0));
+        assert_eq!(edits.graphics.keys().collect::<Vec<_>>(), [&format!("0x{tile:06X}")]);
+        let mut copy = open(&s);
+        let applied = copy.apply_edits(&Edits::from_json(&edits.to_json()).unwrap());
+        assert!(applied.skipped.is_empty(), "{:?}", applied.skipped);
+        copy.commit();
+        assert!(copy.rom.bytes() == game.rom.bytes() && copy.collect_edits() == edits, "{family:?}");
+        // what isn't a frame's tile isn't written: a file can't change the ROM anywhere
+        let mut elsewhere = edits.clone();
+        elsewhere.graphics = [(format!("0x{:06X}", tile + 4), "00".repeat(32)), ("0x000200".to_string(), "00".repeat(32))].into();
+        let mut untouched = open(&s);
+        assert_eq!(untouched.apply_edits(&elsewhere).skipped.len(), 2);
+        assert!(!untouched.commit() && untouched.rom.bytes() == &before[..]);
+        assert!(game.undo().is_some() && game.collect_edits().is_empty() && !game.modified(), "{family:?}");
+    }
+}
+
+/// Writes 32-bit words into bytes
+fn put_words(bytes: &mut [u8], o: usize, words: &[u32]) {
+    for (i, w) in words.iter().enumerate() {
+        bytes[o + i * 4..o + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+}
+
+#[test]
+fn events_are_read_written_and_carried() {
+    for (s, family) in both() {
+        let mut game = open(&s);
+        // the made-up maps have no events: writing some gives the map a struct MapEvents
+        assert!(game.events(0).is_empty());
+        let header = game.maps[0].header.offset;
+        let script = game.new_message_script("Hello, {PLAYER}!\nNice day.\n\nBye!", MSGBOX_NPC).unwrap();
+        let person =
+            Object { id: 1, graphics: 7, x: 2, y: 1, elevation: 3, movement: 8, range: [1, 2], script, flag: 0x20, ..Default::default() };
+        let warp = Warp { x: 0, y: 1, elevation: 0, warp: 2, group: 0, num: 1 };
+        let trigger = Trigger { x: 1, y: 1, elevation: 3, var: 0x4050, value: 1, script };
+        let found = HiddenItem { item: 13, flag: 4, quantity: 1, underfoot: false };
+        let signs = vec![
+            Sign { x: 1, y: 0, elevation: 0, kind: 0, data: script },
+            Sign { x: 2, y: 0, kind: HIDDEN_ITEM, data: found.data(family), ..Default::default() },
+        ];
+        let events = Events { objects: vec![person.clone()], warps: vec![warp.clone()], triggers: vec![trigger], signs };
+        game.set_events(0, &events).unwrap();
+        assert!(game.commit());
+        assert_eq!(game.events(0), events, "{family:?}");
+        assert!(game.rom.ptr(header + 4).is_some(), "the header points to the map's events");
+        assert!(game.events(1).is_empty(), "the other maps have none");
+        assert_eq!(HiddenItem::of(family, game.events(0).signs[1].data), found);
+        // what the script says, as written
+        assert_eq!(
+            game.script_view(script),
+            ScriptView::Says(Says { text: "Hello, {PLAYER}!\nNice day.\n\nBye!".into(), std: MSGBOX_NPC, only: true })
+        );
+        assert_eq!((game.script_view(0), game.made_script(script).map(|m| m.std)), (ScriptView::None, Some(MSGBOX_NPC)));
+
+        // a list that grows goes where there's room (the lists written after it are in the way);
+        // then, last at the free end, it grows there; one that shrinks stays
+        let objects = |game: &Game| game.rom.ptr(game.rom.ptr(header + 4).unwrap() + 4);
+        let mut more = game.events(0);
+        for i in 0..5 {
+            let mut copy = person.clone();
+            (copy.id, copy.x) = (more.next_object_id(), i);
+            more.objects.push(copy);
+            game.set_events(0, &more).unwrap();
+        }
+        assert!(game.commit());
+        assert_eq!(game.events(0), more);
+        assert_eq!(game.events(0).objects.iter().map(|o| o.id).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6]);
+        let moved_to = objects(&game);
+        more.objects.push(person.clone());
+        game.set_events(0, &more).unwrap();
+        assert_eq!((objects(&game), game.events(0)), (moved_to, more.clone()));
+        more.objects.pop();
+        more.remove(List::Objects, 0);
+        more.remove(List::Warps, 0);
+        game.set_events(0, &more).unwrap();
+        assert!(game.commit());
+        assert_eq!(game.events(0), more);
+        // the same events again change nothing
+        let before = game.rom.bytes().to_vec();
+        game.set_events(0, &more).unwrap();
+        assert!(!game.commit() && game.rom.bytes() == &before[..]);
+        let too_many = Events { warps: vec![warp.clone(); 256], ..Default::default() };
+        assert_eq!(game.set_events(0, &too_many), Err(EventsError::TooMany(List::Warps)));
+
+        // carried by an edits file to another copy, with the script written anew there
+        let edits = game.collect_edits();
+        assert_eq!((edits.events.keys().collect::<Vec<_>>(), edits.scripts.len(), edits.maps.len()), (vec![&"0.0".to_string()], 1, 0));
+        let json = edits.to_json();
+        assert!(json.contains("\"events\"") && json.contains("Nice day."), "{json}");
+        let mut copy = open(&s);
+        // the copy's free end isn't where this ROM's is
+        let elsewhere = copy.rom.len() - FREE + 600;
+        copy.rom.write32(elsewhere, 0x1234_5678);
+        copy.commit();
+        let applied = copy.apply_edits(&Edits::from_json(&json).unwrap());
+        assert!(applied.skipped.is_empty() && applied.events == 1, "{:?}", applied.skipped);
+        copy.commit();
+        let carried = copy.events(0);
+        assert_eq!(carried.objects.len(), 5);
+        assert_ne!(carried.objects[0].script, script, "the script was written again, elsewhere");
+        assert!(matches!(copy.script_view(carried.objects[0].script), ScriptView::Says(Says { ref text, .. }) if text.ends_with("Bye!")));
+        let mut renamed = more.clone();
+        renamed.rename_scripts(|s| (s == script).then_some(carried.objects[0].script));
+        assert_eq!(carried, renamed);
+
+        // undone, the map has no events again
+        while game.can_undo() {
+            game.undo();
+        }
+        assert!(game.events(0).is_empty() && !game.modified() && game.collect_edits().is_empty(), "{family:?}");
+    }
+}
+
+#[test]
+fn a_sprite_told_on_16_bits_is_read_so() {
+    for (mut s, _) in both() {
+        let header = open(&s).maps[0].header.offset;
+        let at = s.bytes.len() - FREE;
+        let p = |o: usize| 0x0800_0000 + (at + o) as u32;
+        // struct MapEvents: two objects; each its number, its kind (0), its sprite on 16 bits
+        s.bytes[at..at + 0x80].fill(0);
+        put_words(&mut s.bytes, at, &[2, p(0x20), 0, 0, 0]);
+        for (i, graphics) in [300u16, 7].into_iter().enumerate() {
+            let o = at + 0x20 + i * 24;
+            s.bytes[o] = i as u8 + 1;
+            s.bytes[o + 1] = 0;
+            s.bytes[o + 2..o + 4].copy_from_slice(&graphics.to_le_bytes());
+            s.bytes[o + 4] = 3;
+        }
+        put_words(&mut s.bytes, header + 4, &[p(0)]);
+        let mut game = open(&s);
+        assert!(game.objects_wide());
+        let events = game.events(0);
+        assert_eq!(events.objects.iter().map(|o| (o.id, o.graphics, o.kind, o.x)).collect::<Vec<_>>(), [(1, 300, 0, 3), (2, 7, 0, 3)]);
+        // written back the same way
+        let mut moved = events.clone();
+        moved.objects[0].graphics = 301;
+        game.set_events(0, &moved).unwrap();
+        assert_eq!((game.rom.u8(at + 0x21), game.rom.u16(at + 0x22)), (0, 301));
+        assert_eq!(game.events(0), moved);
+    }
+}
+
+#[test]
+fn the_sprites_are_found_and_drawn() {
+    for (mut s, _) in both() {
+        let at = s.bytes.len() - FREE;
+        let p = |o: usize| 0x0800_0000 + (at + o) as u32;
+        // a 16x32 sprite: its tiles (colours 1 and 2, one after the other), its frame, its struct
+        s.bytes[at..at + 256].fill(0x21);
+        put_words(&mut s.bytes, at + 0x100, &[p(0), 256]);
+        put_words(&mut s.bytes, at + 0x108, &[0x1100_FFFF, 0x0100_1101, 0x0020_0010, 0, p(0), 0, 0, p(0x100), 0]);
+        // the table: 30 of them, the sixth empty
+        let table: Vec<u32> = (0..30).map(|i| if i == 5 { 0 } else { p(0x108) }).collect();
+        put_words(&mut s.bytes, at + 0x200, &table);
+        // the palettes: red and green, and the reflection's
+        put_words(&mut s.bytes, at + 0x300, &[(RED as u32) << 16, GREEN as u32]);
+        put_words(&mut s.bytes, at + 0x340, &[p(0x300), 0x1100, p(0x300), 0x1101, 0, 0x11FF]);
+        let game = open(&s);
+        let sprites = game.sprites();
+        assert_eq!(sprites.count(), 29);
+        assert!(game.sprite(&sprites, 5).is_none() && game.sprite(&sprites, 30).is_none());
+        let sprite = game.sprite(&sprites, 0).unwrap();
+        assert_eq!((sprite.width, sprite.height), (16, 32));
+        assert_eq!((sprite.pixel(0, 0), sprite.pixel(1, 0), sprite.pixel(15, 31)), ([255, 0, 0, 255], [0, 255, 0, 255], [0, 255, 0, 255]));
     }
 }
